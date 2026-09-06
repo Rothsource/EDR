@@ -1,6 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -9,19 +9,30 @@ class AgentCreate(BaseModel):
     hostname: str
     os: str
     enrollment_token: str
+    ip_address: Optional[str] = None 
+    mac_address: Optional[str] = None
 
 
 class AgentResponse(BaseModel):
-    # What the API sends back — notice api_key is excluded.
     agent_id: UUID
     hostname: str
     os: str
     status: str
     created_at: datetime
     last_seen_at: Optional[datetime] = None
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
+
+    @field_serializer("created_at", "last_seen_at") # type: ignore
+    def serialize_as_utc(self, dt: Optional[datetime]) -> Optional[str]:
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)  # naive DB value IS UTC — just label it
+        return dt.isoformat()
 
     class Config:
-        from_attributes = True  # allows Pydantic to read directly from SQLAlchemy model instances
+        from_attributes = True
         
 class AgentRegisterResponse(BaseModel):
     # Returned only once, right after registration — includes the api_key.

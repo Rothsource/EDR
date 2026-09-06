@@ -5,7 +5,7 @@ import AppShell from "../components/AppShell";
 import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
 import GenerateTokenModal from "../components/GenerateTokenModal";
-import { isAgentOnline, relativeTime, formatDate } from "../agentStatus";
+import { getAgentState, relativeTime, formatDate } from "../agentStatus";
 
 export default function Agents() {
   const { forceLogout } = useAuth();
@@ -14,6 +14,9 @@ export default function Agents() {
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [showModal, setShowModal] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(null); // agent_id or null
+  const [busyAgentId, setBusyAgentId] = useState(null); // disable buttons mid-request
 
   async function loadAgents() {
     setLoading(true);
@@ -43,6 +46,58 @@ export default function Agents() {
     return agents.filter((a) => a.hostname.toLowerCase().includes(q));
   }, [agents, search]);
 
+  async function handleRevoke(agentId) {
+    setActionError("");
+    setBusyAgentId(agentId);
+    try {
+      await api.revokeAgent(agentId);
+      await loadAgents();
+    } catch (err) {
+      if (err instanceof AuthError) {
+        forceLogout();
+        return;
+      }
+      setActionError(err.message);
+    } finally {
+      setBusyAgentId(null);
+    }
+  }
+
+  async function handleDelete(agentId) {
+    setActionError("");
+    setBusyAgentId(agentId);
+    try {
+      await api.deleteAgent(agentId);
+      await loadAgents();
+    } catch (err) {
+      if (err instanceof AuthError) {
+        forceLogout();
+        return;
+      }
+      setActionError(err.message);
+    } finally {
+      setBusyAgentId(null);
+      setConfirmingDelete(null);
+    }
+  }
+
+  async function handleUnrevoke(agentId) {
+    setActionError("");
+    setBusyAgentId(agentId);
+    try {
+      await api.unrevokeAgent(agentId);
+      await loadAgents();
+    } catch (err) {
+      if (err instanceof AuthError) {
+        forceLogout();
+        return;
+      }
+      setActionError(err.message);
+    } finally {
+      setBusyAgentId(null);
+    }
+  }
+
   return (
     <AppShell>
       <PageHeader
@@ -62,6 +117,12 @@ export default function Agents() {
       {error && (
         <div className="mb-4 p-3 rounded-lg bg-error-container text-on-error-container text-sm">
           {error}
+        </div>
+      )}
+
+      {actionError && (
+        <div className="mb-4 p-3 rounded-lg bg-error-container text-on-error-container text-sm">
+          {actionError}
         </div>
       )}
 
@@ -102,40 +163,109 @@ export default function Agents() {
           </div>
         ) : filtered.length === 0 ? (
           <div className="p-10 text-center text-sm text-on-surface-variant">
-            No agents match “{search}”.
+            No agents match "{search}".
           </div>
         ) : (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-xs uppercase tracking-wide text-outline bg-surface-container-low">
-                <th className="px-5 py-3 font-medium">Status</th>
-                <th className="px-5 py-3 font-medium">Hostname</th>
-                <th className="px-5 py-3 font-medium">OS</th>
-                <th className="px-5 py-3 font-medium">Enrolled</th>
-                <th className="px-5 py-3 font-medium">Last Seen</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((agent) => (
-                <tr
-                  key={agent.agent_id}
-                  className="border-t border-outline-variant hover:bg-surface-container-low transition-colors"
-                >
-                  <td className="px-5 py-3">
-                    <StatusBadge online={isAgentOnline(agent)} />
-                  </td>
-                  <td className="px-5 py-3 font-medium text-on-surface">{agent.hostname}</td>
-                  <td className="px-5 py-3 text-on-surface-variant">{agent.os}</td>
-                  <td className="px-5 py-3 text-on-surface-variant">
-                    {formatDate(agent.created_at)}
-                  </td>
-                  <td className="px-5 py-3 text-on-surface-variant">
-                    {relativeTime(agent.last_seen_at)}
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase tracking-wide text-outline bg-surface-container-low">
+                  <th className="px-5 py-3 font-medium">Status</th>
+                  <th className="px-5 py-3 font-medium">Hostname</th>
+                  <th className="px-5 py-3 font-medium">OS</th>
+                  <th className="px-5 py-3 font-medium">IP Address</th>
+                  <th className="px-5 py-3 font-medium">MAC Address</th>
+                  <th className="px-5 py-3 font-medium">Enrolled</th>
+                  <th className="px-5 py-3 font-medium">Last Seen</th>
+                  <th className="px-5 py-3 font-medium">Actions</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {filtered.map((agent) => {
+                  const isBusy = busyAgentId === agent.agent_id;
+                  const isRevoked = agent.status === "revoked";
+                  const isConfirmingThis = confirmingDelete === agent.agent_id;
+
+                  return (
+                    <tr
+                      key={agent.agent_id}
+                      className="border-t border-outline-variant hover:bg-surface-container-low transition-colors"
+                    >
+                      <td className="px-5 py-3">
+                        <StatusBadge state={getAgentState(agent)} />
+                      </td>
+                      <td className="px-5 py-3 font-medium text-on-surface whitespace-nowrap">
+                        {agent.hostname}
+                      </td>
+                      <td className="px-5 py-3 text-on-surface-variant whitespace-nowrap">
+                        {agent.os}
+                      </td>
+                      <td className="px-5 py-3 text-on-surface-variant font-mono text-xs whitespace-nowrap">
+                        {agent.ip_address || "—"}
+                      </td>
+                      <td className="px-5 py-3 text-on-surface-variant font-mono text-xs whitespace-nowrap">
+                        {agent.mac_address || "—"}
+                      </td>
+                      <td className="px-5 py-3 text-on-surface-variant whitespace-nowrap">
+                        {formatDate(agent.created_at)}
+                      </td>
+                      <td className="px-5 py-3 text-on-surface-variant whitespace-nowrap">
+                        {relativeTime(agent.last_seen_at)}
+                      </td>
+                      <td className="px-5 py-3 whitespace-nowrap">
+                        {isConfirmingThis ? (
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-error font-medium">Delete?</span>
+                            <button
+                              onClick={() => handleDelete(agent.agent_id)}
+                              disabled={isBusy}
+                              className="text-xs px-2 py-1 rounded bg-error text-on-error font-medium disabled:opacity-50"
+                            >
+                              Confirm
+                            </button>
+                            <button
+                              onClick={() => setConfirmingDelete(null)}
+                              disabled={isBusy}
+                              className="text-xs px-2 py-1 rounded text-on-surface-variant hover:bg-surface-container disabled:opacity-50"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2">
+                            {isRevoked ? (
+                              <button
+                                onClick={() => handleUnrevoke(agent.agent_id)}
+                                disabled={isBusy}
+                                className="text-xs px-2 py-1 rounded text-success hover:bg-success-container disabled:opacity-40 font-medium"
+                              >
+                                Reactivate
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => handleRevoke(agent.agent_id)}
+                                disabled={isBusy}
+                                className="text-xs px-2 py-1 rounded text-warning hover:bg-warning-container disabled:opacity-40 font-medium"
+                              >
+                                Revoke
+                              </button>
+                            )}
+                            <button
+                              onClick={() => setConfirmingDelete(agent.agent_id)}
+                              disabled={isBusy}
+                              className="text-xs px-2 py-1 rounded text-error hover:bg-error-container disabled:opacity-40 font-medium"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 

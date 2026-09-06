@@ -51,6 +51,8 @@ async def register_agent(payload: AgentCreate, db: AsyncSession = Depends(get_db
         hostname=payload.hostname,
         os=payload.os,
         api_key=new_api_key,
+        ip_address=payload.ip_address,
+        mac_address=payload.mac_address,
         status="active",
         enrollment_token=payload.enrollment_token,
     )
@@ -61,7 +63,6 @@ async def register_agent(payload: AgentCreate, db: AsyncSession = Depends(get_db
 
     await db.commit()
     await db.refresh(new_agent)
-
     return AgentRegisterResponse(agent_id=new_agent.agent_id, api_key=new_api_key)
 
 

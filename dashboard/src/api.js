@@ -1,7 +1,7 @@
 // Central place for every call to your FastAPI backend.
 // Base URL comes from .env (VITE_API_URL) so it's easy to point at
 // a different machine on your local network without touching code.
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const TOKEN_KEY = "edr_access_token";
 
@@ -75,6 +75,9 @@ export const api = {
 
   revokeAgent: (agentId) =>
     request(`/admin/agents/${agentId}/revoke`, { method: "PATCH" }),
+
+  unrevokeAgent: (agentId) =>
+    request(`/admin/agents/${agentId}/unrevoke`, { method: "PATCH" }),
 
   deleteAgent: (agentId) =>
     request(`/admin/agents/${agentId}`, { method: "DELETE" }),

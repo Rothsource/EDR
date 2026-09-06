@@ -26,6 +26,13 @@ build/
 /agent/cmd/agent/agent
 /agent/cmd/agent/edr-agent*
 
+* text=auto eol=lf
+*.go text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+
 # ── OS / editor cruft ──────────────────────────────
 .DS_Store
 Thumbs.db

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api, AuthError } from "../api";
+import { api, AuthError, API_URL } from "../api";
 import { useAuth } from "../context/AuthContext";
 
 export default function GenerateTokenModal({ onClose }) {
@@ -9,6 +9,8 @@ export default function GenerateTokenModal({ onClose }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [commandCopied, setCommandCopied] = useState(false);
+  const [os, setOs] = useState("windows"); // "windows" | "linux"
 
   async function handleGenerate() {
     setLoading(true);
@@ -39,6 +41,22 @@ export default function GenerateTokenModal({ onClose }) {
     navigator.clipboard.writeText(token);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  }
+
+  function buildInstallCommand() {
+    if (!token) return "";
+    if (os === "windows") {
+      return `Invoke-WebRequest -Uri "${API_URL}/download/agent/windows" -OutFile "$env:TEMP\\khemstrixAgent.exe"; & "$env:TEMP\\khemstrixAgent.exe" --server=${API_URL} --token=${token}`;
+    }
+    return `curl -o /tmp/khemstrixAgent ${API_URL}/download/agent/linux && chmod +x /tmp/khemstrixAgent && /tmp/khemstrixAgent --server=${API_URL} --token=${token}`;
+  }
+
+  function copyCommand() {
+    const cmd = buildInstallCommand();
+    if (!cmd) return;
+    navigator.clipboard.writeText(cmd);
+    setCommandCopied(true);
+    setTimeout(() => setCommandCopied(false), 2000);
   }
 
   return (
@@ -99,12 +117,47 @@ export default function GenerateTokenModal({ onClose }) {
             </p>
 
             <div className="bg-surface-container-low rounded-lg p-3">
-              <p className="text-xs uppercase tracking-wide text-outline mb-1">
-                Run this on the target machine
-              </p>
-              <code className="block font-mono text-xs text-on-surface break-all">
-                edr-agent.exe --server=http://&lt;your-server-ip&gt;:8000 --token={token}
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs uppercase tracking-wide text-outline">
+                  Run this on the target machine
+                </p>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => setOs("windows")}
+                    className={`text-xs px-2 py-1 rounded ${
+                      os === "windows"
+                        ? "bg-primary text-on-primary"
+                        : "text-on-surface-variant hover:bg-surface-container"
+                    }`}
+                  >
+                    Windows
+                  </button>
+                  <button
+                    onClick={() => setOs("linux")}
+                    className={`text-xs px-2 py-1 rounded ${
+                      os === "linux"
+                        ? "bg-primary text-on-primary"
+                        : "text-on-surface-variant hover:bg-surface-container"
+                    }`}
+                  >
+                    Linux
+                  </button>
+                </div>
+              </div>
+
+              <code className="block font-mono text-xs text-on-surface break-all mb-2">
+                {buildInstallCommand()}
               </code>
+
+              <button
+                onClick={copyCommand}
+                className="w-full h-8 rounded-lg bg-primary text-on-primary text-xs font-medium flex items-center justify-center gap-1.5 hover:opacity-95 transition"
+              >
+                <span className="material-symbols-outlined text-[14px]">
+                  {commandCopied ? "check" : "content_copy"}
+                </span>
+                {commandCopied ? "Copied" : "Copy command"}
+              </button>
             </div>
           </>
         )}

@@ -133,6 +133,127 @@ should call into `detection/` or `response/`, not contain that logic itself.
 router, nothing else.
 **Contains:** No business logic. Just wiring.
 
+## How Agent Authentication Works (`api_key`)
+
+Every agent needs a way to prove "it's still me" on every request after it
+first connects — without the server having to trust just an IP address or a
+hostname (both are easy to spoof). That's what `api_key` is for: a long,
+random, secret string that acts like a password, but for a machine instead
+of a human.
+
+### The problem it solves
+
+Your admin uses a **username + password** to log in as a human, once per
+session, and gets a temporary JWT back.
+
+An **agent** is different — it's an unattended process running on a
+customer's endpoint that needs to check in repeatedly (heartbeats, and later
+event uploads) with no human present to type a password. So instead of
+"login every time," an agent gets issued **one long-lived secret** at the
+moment it registers, and it sends that secret with every future request
+instead of logging in.
+
+### The full flow, end to end
+
+```
+1. Admin (you) generates a one-time enrollment token
+      POST /admin/generate-token   (requires admin JWT — protected route)
+      → returns a random token, valid for 1 hour, single-use
+
+2. That token gets baked into the install script/binary
+   you hand to the customer (e.g. as a --token flag or embedded
+   in a downloaded install command)
+
+3. Customer downloads and runs the script on their machine
+      .\edr-agent.exe --server=http://<your-server-ip>:8000 --token=<the enrollment token>
+
+4. The agent calls the server to register itself
+      POST /agent/register
+      body: { hostname, os, enrollment_token }
+
+      Server checks (routers/agent.py -> register_agent):
+        - does this enrollment token exist?
+        - has it expired? (1 hour window)
+        - has it already been used?
+      If all checks pass:
+        - server generates a NEW random api_key (secrets.token_urlsafe(32))
+        - creates the Agent row, storing that api_key
+        - marks the enrollment token as used (so it can't be reused
+          to register a second agent)
+        - returns { agent_id, api_key } to the agent — ONE TIME ONLY
+
+5. The agent saves { agent_id, api_key } locally
+   (its own config file on the customer's machine — this is now the
+   agent's permanent credential, like a long-lived password)
+
+6. Every heartbeat after that, the agent sends its saved credentials
+   instead of re-registering
+      POST /agent/heartbeat
+      body: { agent_id, api_key }
+
+      Server checks (routers/agent.py -> heartbeat):
+        - does an agent with this agent_id exist?
+        - does its stored api_key match the one just sent?
+      If either check fails -> same generic 401 "invalid credentials"
+      (never reveals which part was wrong, so an attacker probing the
+      endpoint can't tell if an agent_id is real or not)
+```
+
+### Why the enrollment token and the api_key are two different things
+
+| | `enrollment_token` | `api_key` |
+|---|---|---|
+| Purpose | One-time proof "an admin authorized this machine to join" | Ongoing proof "this is the same agent that registered before" |
+| Lifespan | 1 hour, single-use, then dead | Lives as long as the agent is enrolled |
+| Where it's used | Only once, in `POST /agent/register` | Every single heartbeat (and future event uploads) |
+| Who generates it | The **server**, on admin request | The **server**, automatically, at registration time |
+
+Splitting these apart means a leaked/expired enrollment token is useless
+after an hour and can't be reused to enroll a second (rogue) device, while
+the `api_key` that actually matters long-term is never sent over the network
+until the one moment it's created.
+
+### How `api_key` is generated (the actual code)
+
+`routers/agent.py`, inside `register_agent()`:
+```python
+new_api_key = secrets.token_urlsafe(32)
+```
+`secrets.token_urlsafe(32)` uses Python's cryptographically secure random
+number generator (not the regular `random` module, which is predictable and
+unsafe for this) to produce a 32-byte random value, encoded as a URL-safe
+base64 string. This is the same function already used to generate
+enrollment tokens (`secrets.token_urlsafe(32)` in `admin.py`) — consistent
+approach for anything that needs to be an unguessable secret.
+
+This key is:
+- **Never chosen or influenced by the client** — always fully random,
+  generated server-side, so there's no risk of a weak/predictable key
+- **Shown to the agent exactly once**, in the `POST /agent/register`
+  response (`AgentRegisterResponse` schema — the *only* schema that includes
+  `api_key`)
+- **Stored in plaintext in Postgres** (`agents.api_key`) — unlike
+  `users.password_hash`, this is intentional: heartbeat verification does a
+  direct string comparison (`agent.api_key != payload.api_key`), not a
+  hash-and-compare like login does. See the architecture doc's hardening
+  notes if you want to upgrade this to a hashed comparison later.
+- **Excluded from every other response** — `GET /agents` uses `AgentResponse`,
+  which has no `api_key` field at all, so it's never visible to anyone
+  browsing the agent list, admin or not.
+
+### If an agent's `api_key` is ever compromised
+
+There's currently no "revoke and reissue" endpoint — if a customer's machine
+is compromised and its `api_key` leaks, the current options are:
+1. Manually delete/deactivate that row in `agents` via Postgres, and
+2. Have the agent re-run the registration flow with a fresh enrollment
+   token to get a new `api_key`
+
+A dedicated `POST /admin/agents/{agent_id}/revoke` endpoint (protected,
+admin-only) is a reasonable future addition once you're past the prototype
+stage — worth noting in the roadmap alongside the other pre-production
+hardening items.
+
 ---
 
 ## 3. The Checklist: Adding a New Table

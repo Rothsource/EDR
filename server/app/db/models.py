@@ -30,11 +30,10 @@ class Agent(Base):
     enrollment_token = Column(Text, ForeignKey("enrollment_tokens.token"))
     created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
     last_seen_at = Column(TIMESTAMP)
+    ip_address = Column(Text)      
+    mac_address = Column(Text)     
 
-    # Relationship back to the EnrollmentToken this agent used
     enrollment_token_obj = relationship("EnrollmentToken", back_populates="agents")
-
-    # Relationship to all events this agent has sent
     # events = relationship("Event", back_populates="agent")
 
 class User(Base):

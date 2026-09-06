@@ -1,4 +1,5 @@
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -86,3 +87,25 @@ async def delete_agent(
         raise HTTPException(status_code=500, detail="failed to delete agent")
 
     return AgentActionResponse(status="deleted")
+
+@router.patch("/agents/{agent_id}/unrevoke", response_model=AgentActionResponse)
+async def unrevoke_agent(
+    agent_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user_id: str = Depends(get_current_user_id),
+):
+    result = await db.execute(select(Agent).where(Agent.agent_id == agent_id))
+    agent = result.scalar_one_or_none()
+
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    agent.status = "active"
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="failed to unrevoke agent")
+
+    return AgentActionResponse(status="active")
