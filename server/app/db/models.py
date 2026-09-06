@@ -35,20 +35,27 @@ class Agent(Base):
     enrollment_token_obj = relationship("EnrollmentToken", back_populates="agents")
 
     # Relationship to all events this agent has sent
-    events = relationship("Event", back_populates="agent")
+    # events = relationship("Event", back_populates="agent")
 
+class User(Base):
+    __tablename__ = "users"
 
-class Event(Base):
-    __tablename__ = "events"
+    user_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    username = Column(Text, nullable=False, unique=True)
+    password_hash = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
 
-    event_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
-    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.agent_id"), nullable=False)
-    event_type = Column(Text, nullable=False)
-    timestamp = Column(TIMESTAMP, nullable=False, server_default=func.now())
-    raw_data = Column(JSONB)
-    extracted_features = Column(JSONB)
-    score = Column(Float)
-    verdict = Column(Text)
+# class Event(Base):
+#     __tablename__ = "events"
 
-    # Relationship back to the Agent that sent this event
-    agent = relationship("Agent", back_populates="events")
+#     event_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+#     agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.agent_id"), nullable=False)
+#     event_type = Column(Text, nullable=False)
+#     timestamp = Column(TIMESTAMP, nullable=False, server_default=func.now())
+#     raw_data = Column(JSONB)
+#     extracted_features = Column(JSONB)
+#     score = Column(Float)
+#     verdict = Column(Text)
+
+#     # Relationship back to the Agent that sent this event
+#     agent = relationship("Agent", back_populates="events")

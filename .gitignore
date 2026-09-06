@@ -1,0 +1,36 @@
+# ── Python (server/) ──────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# ── Environment secrets ───────────────────────────
+.env
+*.env.local
+
+# ── Node / React (dashboard/) ─────────────────────
+node_modules/
+dist/
+build/
+.vite/
+*.local
+
+# ── Go (agent/) ────────────────────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+/agent/cmd/agent/agent
+/agent/cmd/agent/edr-agent*
+
+# ── OS / editor cruft ──────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Logs ───────────────────────────────────────────
+*.log

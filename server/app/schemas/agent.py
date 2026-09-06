@@ -32,3 +32,5 @@ class AgentHeartbeat(BaseModel):
     agent_id: UUID
     api_key: str
     
+class AgentActionResponse(BaseModel):
+    status: str

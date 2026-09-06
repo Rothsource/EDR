@@ -33,15 +33,30 @@ Every layer has ONE job. Never let a layer do another layer's job (e.g. never
 put raw SQL string-building inside a router, never put request-validation logic
 inside `models.py`).
 
+For protected routes, there's one more layer sitting in front of the router:
+
+```
+Client
+  │
+  ▼
+Authorization: Bearer <token> header
+  │
+  ▼
+core/deps.py  → get_current_user_id()   ← verifies JWT signature + expiry
+  │
+  ▼
+routers/*.py                             ← only runs if the dependency succeeded
+```
+
 ---
 
 ## 2. What Each File Actually Does
 
 ### `config.py`
-**Job:** Read `.env`, expose `settings.DATABASE_URL`.
+**Job:** Read `.env`, expose `settings.DATABASE_URL` and `settings.JWT_SECRET_KEY`.
 **Contains:** Zero logic. Just environment loading.
 **You touch this:** Almost never, after initial setup — maybe to add new
-settings (e.g. `JWT_SECRET`, `TOKEN_VALIDITY_HOURS`) as your app grows.
+settings as your app grows.
 
 ### `db/database.py`
 **Job:** Create the async engine (connection pool), the session factory, the
@@ -66,7 +81,7 @@ independent from the DB structure.
 endpoint accepts/returns.
 **Why it's separate from `models.py`:** the DB table often has fields the
 client should never send (`agent_id`, `created_at`) or never see again
-(`api_key` after the one-time reveal). Schemas let you control exactly what's
+(`api_key`, `password_hash`). Schemas let you control exactly what's
 exposed, per-endpoint.
 
 ### `routers/*.py`
@@ -81,6 +96,26 @@ endpoint is called."
 - Returning data shaped by a response schema
 
 **You touch this:** Every time you build a new feature/endpoint.
+
+### `core/security.py`
+**Job:** Password hashing and JWT create/verify — pure functions, no request
+handling, no DB access.
+**Contains:**
+- `hash_password()` / `verify_password()` — bcrypt via passlib
+- `create_access_token()` / `decode_access_token()` — JWT via python-jose,
+  signed with `settings.JWT_SECRET_KEY`, 24h expiry
+**You touch this:** Rarely — maybe to change token expiry duration or add
+a refresh-token flow later.
+
+### `core/deps.py`
+**Job:** FastAPI dependencies that guard routes — currently just
+`get_current_user_id`.
+**Contains:** Reads the `Authorization: Bearer <token>` header, calls
+`decode_access_token()`, raises `401 not authenticated` on anything missing/
+invalid/expired, otherwise returns the `user_id` from the token.
+**You touch this:** To protect any new route, add
+`Depends(get_current_user_id)` as a parameter — no changes needed to this
+file itself unless you add new kinds of guards (e.g. role-based checks later).
 
 ### `detection/` and `response/`
 **Job (once you build into them):**
@@ -133,7 +168,11 @@ class Alert(Base):
 ```
 If you add a `relationship(...)`, remember to add the reverse side on the
 related model too (e.g. `alerts = relationship("Alert", back_populates="agent")`
-on `Agent`).
+on `Agent`). **Gotcha you already hit once:** if you comment out or remove a
+model class, also comment out/remove any `relationship("ThatClass", ...)`
+pointing at it elsewhere — SQLAlchemy fails at mapper-configuration time with
+a `KeyError`/`InvalidRequestError` if a relationship references a class name
+that isn't registered.
 
 ### Step 3 — Add schemas in `schemas/alert.py`
 Ask: what should a client be allowed to **send**, and what should they be
@@ -168,6 +207,19 @@ async def create_alert(payload: AlertCreate, db: AsyncSession = Depends(get_db))
     return new_alert
 ```
 
+If the route should be admin-only, add the auth dependency too:
+```python
+from core.deps import get_current_user_id
+
+@router.post("/alerts", response_model=AlertResponse)
+async def create_alert(
+    payload: AlertCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user_id: str = Depends(get_current_user_id),
+):
+    ...
+```
+
 ### Step 5 — Wire the router into `main.py`
 ```python
 from routers import alerts
@@ -176,7 +228,9 @@ app.include_router(alerts.router, tags=["alerts"])
 
 ### Step 6 — Test via `/docs`
 Run the server, open `http://localhost:8000/docs`, and manually exercise the
-new endpoint(s) before building anything on top of them.
+new endpoint(s) before building anything on top of them. For protected
+routes, test both without and with a valid `Authorization: Bearer <token>`
+header — confirm you get `401 not authenticated` in the first case.
 
 ---
 
@@ -203,8 +257,10 @@ the layers. SQLAlchemy does not auto-sync with the database — you keep
 - **`models.py` = structure only.** If you're tempted to write an `if`
   statement in there, it belongs in a router or a service module instead.
 - **`schemas/` = contract with the outside world.** Never expose secrets
-  (`api_key`) in a general-purpose response schema — only in a dedicated
-  one-time response schema (like `AgentRegisterResponse`).
+  (`api_key`, `password_hash`) in a general-purpose response schema — only
+  in a dedicated one-time response schema (like `AgentRegisterResponse`),
+  or never at all (there is no `UserResponse` that includes `password_hash`,
+  and there shouldn't be).
 - **Routers should stay thin.** If a router function starts getting long
   (validating, scoring, deciding a response action, sending alerts...),
   pull the scoring/response logic out into `detection/` or `response/` and
@@ -212,7 +268,9 @@ the layers. SQLAlchemy does not auto-sync with the database — you keep
 - **Same error for different failure reasons, when it matters for security.**
   E.g. `heartbeat` returns the same `401 invalid credentials` whether the
   `agent_id` doesn't exist or the `api_key` is wrong — this prevents an
-  attacker from enumerating valid agent IDs.
+  attacker from enumerating valid agent IDs. `POST /auth/login` follows the
+  same rule: wrong username and wrong password both return the same
+  `401 invalid credentials`.
 - **Never build raw SQL strings with f-strings/concatenation.** Always use
   SQLAlchemy's `select(...)`/`.where(...)` or parameterized queries (`$1`,
   `$2` with asyncpg). This is what protects you from SQL injection by
@@ -221,6 +279,16 @@ the layers. SQLAlchemy does not auto-sync with the database — you keep
   `api_key` or a freshly generated token should have a dedicated `*Response`
   schema used only at creation time, separate from the general "list/get"
   response schema.
+- **A valid JWT proves "who you were when the token was issued," not
+  "confirm this sensitive change right now."** That's why
+  `PUT /auth/change-password` still requires the current password even
+  though the caller already passed the JWT check — a stolen/leaked token
+  shouldn't be enough on its own to lock the real owner out of their account.
+- **Postgres columns here are `timestamp without time zone`.** Always strip
+  `tzinfo` (`.replace(tzinfo=None)`) before storing a
+  `datetime.now(timezone.utc)` value, but return the tz-aware version in API
+  responses. JWT expiry (`exp` claim) doesn't hit this issue — `python-jose`
+  handles the conversion internally.
 
 ---
 
@@ -245,19 +313,82 @@ that's the signal to introduce it.
 
 ## 7. Current Project Snapshot (as of this guide)
 
-**Tables in Postgres:** `enrollment_tokens`, `agents` (`events` defined in
-`models.py` but not yet created in Postgres — create it when you're ready to
-build event ingestion).
+**Tables in Postgres:** `enrollment_tokens`, `agents`, `users`.
+`events` is defined in `models.py` but currently commented out (along with
+the matching `Agent.events` relationship) — not yet created in Postgres.
+Uncomment both sides and create the table when you're ready to build event
+ingestion.
+
+**New folder: `core/`**
+- `core/security.py` — password hashing (bcrypt via passlib) and JWT
+  create/verify helpers (python-jose, `HS256`, 24h expiry, signed with
+  `settings.JWT_SECRET_KEY`). Pure functions — no DB access, no request
+  handling.
+- `core/deps.py` — `get_current_user_id`, a FastAPI dependency that reads
+  the `Authorization: Bearer <token>` header, verifies it, and either
+  returns the `user_id` or raises `401 not authenticated`. Add this as a
+  `Depends()` on any route that should require login.
+
+**New schema file: `schemas/auth.py`**
+- `LoginRequest` — `username`, `password`
+- `TokenResponse` — `access_token`, `token_type` (defaults to `"bearer"`)
+- `ChangePasswordRequest` — `current_password`, `new_password`
+
+**New router: `routers/auth.py`, mounted at `/auth`**
+- `POST /auth/login` — looks up the user, verifies the password hash,
+  returns a JWT on success. Same generic `401 invalid credentials` for
+  "user doesn't exist" and "wrong password."
+- `PUT /auth/change-password` — protected route (requires a valid JWT).
+  Also requires the caller to supply their *current* password before
+  setting a new one, even though they're already authenticated — this
+  prevents a stolen token alone from being enough to lock out the real
+  admin.
+
+**Bootstrapping the first admin: `create_admin.py`**
+A one-time CLI script (run manually, not exposed via any endpoint) that
+prompts for a username/password and inserts the first row into `users`,
+with the password hashed via `core/security.hash_password()`. There is no
+public signup route — this is intentional. This script is a **development/
+testing tool**, not a production onboarding flow; see the note at the end of
+this section for what a real deployment would need instead.
 
 **Endpoints built:**
+- `POST /auth/login` — admin login, returns JWT
+- `PUT /auth/change-password` — admin changes their own password (protected)
 - `POST /admin/generate-token` — admin creates a one-time enrollment token
-- `POST /agent/register` — new agent registers using a valid token
+  (**protected** — requires `Authorization: Bearer <token>`)
+- `POST /agent/register` — new agent registers using a valid enrollment token
 - `POST /agent/heartbeat` — registered agent proves it's alive
-- `GET /agents` — list all agents (excludes `api_key`)
+- `GET /agents` — list all agents, excludes `api_key`
+  (**not yet protected** — see "Next natural additions" below)
+
+**How to test the full auth flow via `/docs`:**
+1. `POST /admin/generate-token` with no `Authorization` header →
+   expect `401 {"detail": "not authenticated"}`
+2. `POST /auth/login` with your admin username/password →
+   copy the `access_token` from the response
+3. Call `POST /admin/generate-token` again, this time manually adding header
+   `Authorization: Bearer <token>` → expect a `200` with the enrollment token
+   (note: since this dependency is a plain `Header(...)` check rather than
+   FastAPI's `OAuth2PasswordBearer` scheme, the Swagger "Authorize" lock icon
+   in `/docs` won't auto-attach the header — set it manually per-request, or
+   test with curl/Postman)
 
 **Next natural additions**, in likely order:
-1. `events` table + `routers/events.py` — agent event ingestion
-2. `detection/` scoring logic — turn raw events into `score` + `verdict`
-3. `response/` actions — act on verdicts (isolate host, alert, etc.)
-4. Authentication on `/admin/*` routes (currently open, fine for local-only use)
+1. Protect `GET /agents` the same way `/admin/generate-token` is protected
+   — currently it's the one remaining open route that probably shouldn't be
+2. `events` table + `routers/events.py` — agent event ingestion
+3. `detection/` scoring logic — turn raw events into `score` + `verdict`
+4. `response/` actions — act on verdicts (isolate host, alert, etc.)
 5. Alembic, once schema changes become frequent
+6. Admin dashboard frontend (`dashboard/`, currently just planned) — login
+   page, protected routes on the frontend side, token storage
+   (localStorage is fine for a local-network student prototype; note it as
+   a pre-production hardening item alongside HTTPS and multi-tenancy)
+7. Production-grade admin bootstrapping — `create_admin.py` is a dev/testing
+   tool, not something you'd hand to a real SME customer. Before any real
+   deployment, replace or supplement it with one of: (a) auto-generate a
+   random admin password on first startup and print it once to the console/
+   logs, (b) force a password change on first login via a
+   `must_change_password` flag, or (c) a first-run setup wizard in the
+   dashboard that prompts the user to choose their own admin credentials.
