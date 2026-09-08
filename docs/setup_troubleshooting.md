@@ -53,8 +53,8 @@ VITE_API_URL=http://localhost:8000
 Change this to your server's real LAN IP or domain once you need the
 dashboard — or, critically, the agent install command it generates — to
 be reachable from anywhere other than the exact machine running the
-dashboard. See §3.4 below; this is one of the most common points of
-confusion.
+dashboard. See §3.4 and §4.1 below; this is one of the most common points
+of confusion.
 
 **`.env` changes require a full restart** of `npm run dev` (`Ctrl+C` then
 re-run) — Vite's hot-reload does not pick up new environment variables on
@@ -296,6 +296,84 @@ in `main.go` treats that as "first-time install" and goes through
 `Register()` again from scratch, producing a brand-new `agent_id` and
 `api_key`.
 
+### 3.4 Agent suddenly can't reach the server anymore, even though nothing
+about the agent itself changed — `heartbeat failed: cannot reach server:
+... context deadline exceeded`
+
+**Symptom:** an agent that was working fine (had successful heartbeats
+before) suddenly starts failing every single heartbeat with a network-level
+error like:
+```
+heartbeat failed (will retry next cycle): cannot reach server: Post
+"http://172.16.104.160:8000/agent/heartbeat": context deadline exceeded
+(Client.Timeout exceeded while awaiting headers)
+```
+`systemctl status` still shows the service `active (running)` — the agent
+process itself is healthy, it just can't reach anything at that address.
+Restarting the service (`systemctl restart khemstrix-agent`) does **not**
+fix it on its own.
+
+**Cause:** the server's IP address changed (e.g. the server machine moved
+to a different network, or its DHCP lease renewed with a new address) —
+but the agent has the **old** IP permanently baked into `config.json`'s
+`"server"` field, from the moment it first registered. Nothing about the
+agent watches for or auto-detects a server IP change; it will keep dialing
+the same stale address forever, by design, since `config.Load()` finds an
+existing config and never re-reads `--server` from a fresh command-line
+invocation once it's already registered.
+
+**Why re-running the one-liner does NOT fix this:** `run.go` only uses the
+`--server`/`--token` flags when **no local config exists yet**. Since a
+config file already exists (from the original registration), any new
+`--server` value passed on the command line is silently ignored — the
+agent will keep loading and using the old IP from disk regardless of what
+flag you pass. This applies even if you re-download and re-run the
+one-liner fresh; the presence of the old `config.json` alone is what
+causes it to skip registration entirely.
+
+**Fix — edit the saved config directly, no reinstall/re-registration
+needed:**
+
+Linux:
+```bash
+sudo systemctl stop khemstrix-agent
+sudo nano /etc/khemstrix-agent/config.json   # update the "server" field
+sudo systemctl restart khemstrix-agent
+```
+
+Windows:
+```powershell
+Stop-Service khemstrix-agent
+notepad "$env:ProgramData\khemstrix-agent\config.json"   # update "server"
+Restart-Service khemstrix-agent
+```
+
+Only the `"server"` value needs to change — leave `agent_id` and `api_key`
+untouched, since those still identify a valid, already-registered agent.
+This preserves the agent's history in Postgres (same `agent_id`
+throughout) rather than creating a duplicate "new" agent, which a full
+uninstall-and-re-enroll would do instead.
+
+**Confirm the fix worked** — wait ~30–90s after restarting, then check:
+```bash
+cat /etc/khemstrix-agent/state.json
+```
+`last_success_at` should show a fresh, advancing timestamp with no
+`last_error` key present. The dashboard's "Offline" badge will clear on
+its own shortly after — it just reflects `last_seen_at` in Postgres, which
+updates automatically on the next successful heartbeat, no dashboard
+action needed.
+
+**Known gap, not yet built:** there is currently no command or mechanism
+to update the server address centrally — it must be hand-edited on every
+affected machine, individually, exactly as above. If the server's IP
+changes often (e.g. frequent lab/VM testing across different networks),
+consider giving the server machine a static/reserved IP to avoid hitting
+this repeatedly. A future `khemstrix-agent set-server <url>` subcommand,
+or a small always-reachable "redirect" endpoint the agent checks before
+each heartbeat, would remove the need for manual file edits — noted as a
+possible improvement, not yet implemented.
+
 ---
 
 ## 4. Cross-Machine / VM Testing Problems
@@ -372,6 +450,14 @@ JavaScript/React, not a crash.
 ```
 not a differently-shaped prop.
 
+**Also worth checking first, before assuming this is a code bug:** an
+agent genuinely showing "Offline" is often just an accurate report — see
+§3.4 above for a real-world case where "Offline" was completely correct
+because the agent's saved server address had gone stale after the
+server's IP changed. Confirm the agent is actually heartbeating
+successfully (check `state.json` on the endpoint itself) before assuming
+the dashboard's status logic is wrong.
+
 ### 5.2 Page content doesn't fill the full browser width
 
 **Cause:** a `max-w-*` Tailwind class (e.g. `max-w-6xl`) on the main
@@ -403,3 +489,16 @@ window size.
   heartbeating, you have to act on that machine directly (kill the
   process, clear its config, or uninstall) — the dashboard only ever
   controls the database record.
+- **On the agent side specifically, treat `journalctl -u khemstrix-agent`
+  (Linux) / the Windows Event Log (Windows) as the first source of truth,
+  and `state.json` as the second.** The systemd/SCM status only tells you
+  the *process* is alive, not that it's successfully reaching the server —
+  those are genuinely different things that can disagree (see §3.4). Always
+  check both `systemctl status` (process alive?) and `state.json`
+  (actually connecting?) before concluding something's fixed or broken.
+- **When an agent that used to work suddenly can't reach the server,
+  suspect the server's address before suspecting the agent's code.** A
+  changed server IP produces symptoms (`context deadline exceeded`) that
+  look identical to a firewall or VM networking problem — check whether
+  the server's IP actually changed first (§3.4) before re-diagnosing VM
+  networking from scratch (§4.2).
