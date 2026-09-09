@@ -14,14 +14,21 @@ Inspired by South Korea's AhnLab model—starting with domestic, underserved sec
 
 **Regulatory and Sovereignty Gaps:** Emerging frameworks (MPTC Draft Cybersecurity Law, Draft Personal Data Protection Law, NBC-TCRMG) mandate auditable security monitoring, log retention, and strict data privacy. Small businesses currently have no accessible platform that satisfies compliance without exposing sensitive communications to overseas commercial clouds.
 
-## 3. The Proposed Solution
+## 3. Deployment Models: On-Premise SME vs. Centralized Sovereign Cloud
 
-KhemStrix solves this by delivering an end-to-end telemetry and automated response pipeline built on four principles:
+KhemStrix is engineered from a single codebase to support two deployment realities without requiring architectural rewrites as the project scales.
 
-- **Ultra-Lightweight Endpoint Footprint:** A single static Go binary (<30MB RAM) running as a persistent background daemon (systemd on Linux, Windows Service on Windows) with zero runtime dependencies.
-- **Privacy-First Inspection (Zero Raw-Data Storage):** Threat evaluation occurs via structured feature extraction (hashes, heuristics, metadata, intent classification). Private message bodies and confidential documents are discarded from memory immediately after inference, never resting on disk.
-- **Dual Ingestion Engine:** Asynchronous, decoupled ingestion queues that buffer telemetry spikes locally on low-resource machines without requiring heavy message brokers like Kafka or Redis.
-- **Context-Aware AI & MITRE ATT&CK Mapping:** Combining rule-based heuristics, VirusTotal hash validation, and fine-tuned machine learning models to detect social engineering and correlate system anomalies directly to globally recognized adversarial tactics.
+### Model 1: Autonomous On-Premise (Private SME Node)
+
+Designed for individual Cambodian businesses—such as clinics, accounting firms, and local logistics offices—that require total data privacy and operate on strict hardware budgets. In this model, the entire backend (FastAPI, PostgreSQL, and the management dashboard) runs locally on an existing office workstation or mini-PC inside the company LAN. The Go agent reports directly to this local node with zero outbound cloud dependencies. To run reliably on low-spec hardware without crashing, event ingestion uses an in-process asynchronous queue rather than external brokers like Redis, and detection relies on lightweight, offline-trained models. No company telemetry, email metadata, or file hashes ever leave the physical office network.
+
+### Model 2: Sovereign Managed Cluster (Centralized Multi-Tenant Hub)
+
+Designed for managed service providers, domestic telecom operators, or national cybersecurity authorities (such as MPTC and CamCERT) to deliver managed threat detection to micro-businesses that lack on-premise servers. In this model, the backend is hosted centrally in a domestic cloud facility. Hundreds of external organizations deploy the lightweight Go agent and point outbound over HTTPS to this central cluster. Strict multi-tenancy is enforced at the database layer via organization identifiers, ensuring complete data isolation between businesses while enabling the central platform to aggregate anonymized threat signatures into a collective national threat radar.
+
+### Unified Architecture Strategy
+
+To support both environments from day one, the team builds against the multi-tenant database schema and decoupled event pipeline immediately. For local SME use (Model 1), the system assigns all endpoints to a default organization identifier, operating as a self-contained node. When scaling to a centralized provider (Model 2), the identical server code simply registers additional organization records, eliminating the need to refactor database models or agent networking later.
 
 ## 4. Phased Implementation Roadmap
 
