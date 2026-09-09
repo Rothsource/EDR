@@ -6,6 +6,16 @@ from sqlalchemy.orm import relationship
 
 from db.database import Base
 
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    org_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    name = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+
+    enrollment_tokens = relationship("EnrollmentToken", back_populates="organization")
+    agents = relationship("Agent", back_populates="organization")
+
 
 class EnrollmentToken(Base):
     __tablename__ = "enrollment_tokens"
@@ -17,6 +27,10 @@ class EnrollmentToken(Base):
 
     # Reverse relationship: lets you do enrollment_token.agents to see all agents that used this token
     agents = relationship("Agent", back_populates="enrollment_token_obj")
+    
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("organizations.org_id"), nullable=False)
+
+    organization = relationship("Organization", back_populates="enrollment_tokens")
 
 
 class Agent(Base):
@@ -34,6 +48,10 @@ class Agent(Base):
     mac_address = Column(Text)     
 
     enrollment_token_obj = relationship("EnrollmentToken", back_populates="agents")
+    
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("organizations.org_id"), nullable=False)
+
+    organization = relationship("Organization", back_populates="agents")
     # events = relationship("Event", back_populates="agent")
 
 class User(Base):

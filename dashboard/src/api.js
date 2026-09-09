@@ -1,7 +1,7 @@
 // Central place for every call to your FastAPI backend.
 // Base URL comes from .env (VITE_API_URL) so it's easy to point at
 // a different machine on your local network without touching code.
-export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+export const API_URL = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000`;
 
 const TOKEN_KEY = "edr_access_token";
 

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from core.constants import DEFAULT_TENANT_ID
 
 from db.database import get_db
 from db.models import Agent, EnrollmentToken
@@ -55,6 +56,7 @@ async def register_agent(payload: AgentCreate, db: AsyncSession = Depends(get_db
         mac_address=payload.mac_address,
         status="active",
         enrollment_token=payload.enrollment_token,
+        tenant_id=DEFAULT_TENANT_ID, 
     )
     db.add(new_agent)
 
@@ -71,12 +73,16 @@ async def heartbeat(payload: AgentHeartbeat, db: AsyncSession = Depends(get_db))
     result = await db.execute(select(Agent).where(Agent.agent_id == payload.agent_id))
     agent = result.scalar_one_or_none()
 
-    # Same generic error for "not found", "wrong key", AND "revoked" — avoids
-    # leaking to a probing attacker whether an agent_id exists or what state it's in.
     if agent is None or agent.api_key != payload.api_key or agent.status != "active":
         raise HTTPException(status_code=401, detail="invalid credentials")
 
     agent.last_seen_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if payload.ip_address and payload.ip_address != agent.ip_address:
+        agent.ip_address = payload.ip_address
+    if payload.mac_address and payload.mac_address != agent.mac_address:
+        agent.mac_address = payload.mac_address
+
     await db.commit()
 
     return {"status": "ok"}

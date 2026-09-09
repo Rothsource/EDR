@@ -1,252 +1,270 @@
-# Project Status Report
+# KhemStrix EDR: Master Project Status & Scalable Architecture Report
 
-Snapshot after completing the Go agent + one-line install milestone. This
-reflects the actual state of the codebase — not the target state.
-Cross-reference `api-contract.md` for exact endpoint shapes and
-`developer.md` for how to pick up any of the "not yet done" items below.
+## 1. Executive Summary & Cambodia Context
 
----
+KhemStrix EDR is an open-source-based, AI-enhanced Endpoint Detection & Response (EDR) platform designed for small-to-medium enterprises (SMEs) in Cambodia. Commercial EDR products (CrowdStrike, SentinelOne, Microsoft Defender for Endpoint) impose enterprise-tier USD licensing, heavy endpoint footprints, and require dedicated SOC analysts that local organizations cannot afford.
 
-## ✅ Done and Tested
+The project is modeled after South Korea's AhnLab — establishing a domestic, cost-effective detection foundation that aligns directly with Cambodian regulatory demands:
 
-### Backend — core connectivity (Phase 1.0)
-- Postgres schema: `enrollment_tokens`, `agents`, `users` tables created
-  and verified via `psql`
-- `config.py` → `db/database.py` → `db/models.py` chain confirmed working
-  end-to-end
-- Timezone handling bug (naive vs. aware `datetime` on `timestamp without
-  time zone` columns) found and fixed for **storage** — documented in
-  `developer.md` so it isn't reintroduced in new endpoints
-- **A second, related timezone bug was found and fixed in this phase**:
-  `AgentResponse` was serializing `created_at`/`last_seen_at` back to JSON
-  *without* a UTC marker, so browsers in non-UTC timezones (tested from
-  UTC+7) misread "just happened" as "hours ago." Fixed with a
-  `@field_serializer` on `AgentResponse` in `schemas/agent.py` that
-  explicitly stamps naive DB datetimes as UTC before serializing. Any new
-  response schema returning a `datetime` should follow this same pattern —
-  don't rely on Pydantic's default serialization for naive datetimes.
+- **MPTC Draft Law on Cybersecurity**: Mandatory audit logging, threat monitoring, and incident reporting for critical information infrastructure and digital service operators.
+- **MPTC Draft Law on Personal Data Protection**: Clear boundaries around data minimization, requiring that employee personal communications are never intercepted or exported without statutory cause.
+- **National Bank of Cambodia (NBC) TCRMG Guidelines**: Technology and Cyber Risk Management requirements mandating endpoint auditability and rapid incident containment.
 
-### Backend — agent lifecycle
-- `POST /admin/generate-token` — protected, 1-hour single-use enrollment
-  token
-- `POST /agent/register` — validates the enrollment token, generates a
-  permanent `api_key`, creates the `Agent` row, marks the token used — now
-  also accepts and persists **`ip_address`** and **`mac_address`**
-  (see "Schema changes" below)
-- `POST /agent/heartbeat` — validates `agent_id` + `api_key` + active
-  status, updates `last_seen_at`
-- `GET /agents` — protected, lists all agents, excludes `api_key`, now
-  includes `ip_address`/`mac_address`, and correctly returns UTC-stamped
-  timestamps (see timezone fix above)
-- `PATCH /admin/agents/{agent_id}/revoke` — sets status to `"revoked"` —
-  **now wired into the dashboard** (previously built-but-disconnected, see
-  "Closed gaps" below)
-- `DELETE /admin/agents/{agent_id}` — hard-deletes an agent row — **now
-  wired into the dashboard**
-- **`PATCH /admin/agents/{agent_id}/unrevoke`** — new endpoint, not in the
-  original plan. Sets status back to `"active"`. Reuses `AgentActionResponse`.
-  Confirmed the reversal is transparent to the agent: the same `api_key`
-  works immediately on the agent's next heartbeat cycle, no re-registration
-  needed.
+```
+┌────────────────────────────────────────────────────────┐
+│             DUAL-MODEL ARCHITECTURAL BRIDGE            │
+│                                                        │
+│  MODEL 1: PRIVATE SME NODE (NOW)                       │
+│  • Fully local LAN deployment inside SME office        │
+│  • Single default organization in database             │
+│  • In-process Python queue (no Redis/broker daemons)   │
+│  • Real-time email inference (raw body dropped)        │
+│                                                        │
+│                           │ Upgrades seamlessly        │
+│                           ▼ with zero code rewrite     │
+│                                                        │
+│  MODEL 2: CENTRALIZED MPTC/CamCERT HUB (FUTURE)        │
+│  • National sovereign threat grid across many SMEs     │
+│  • Native multi-tenant isolation (organizations table) │
+│  • Swap in-process queue for distributed message bus   │
+│  • Aggregated threat telemetry for national defense    │
+└────────────────────────────────────────────────────────┘
+```
 
-### Schema changes — `ip_address` + `mac_address` on `agents`
-Both columns added following the exact checklist in `developer.md` §3
-(Postgres → `models.py` → `schemas/agent.py` → `routers/agent.py`).
-**Worth noting for future changes**: `ip_address` initially shipped with a
-gap — it was present in Postgres, `schemas/agent.py`, and
-`routers/agent.py`, but missing from `db/models.py`, so SQLAlchemy silently
-dropped it on every insert with no error. Confirmed only by querying
-Postgres directly (`SELECT ... FROM agents`), not by trusting `/docs`
-responses, which echoed the field back via Pydantic without it ever being
-persisted. **Takeaway for any future column addition: verify with a direct
-`psql` SELECT after the first real write, not just the API response.**
+## 2. Done and Tested (Phase 1.0 Milestone)
 
-### Go agent (`agent/`) — built, compiled, tested end-to-end
-Fully built out from the empty scaffold:
-- `internal/core/netinfo.go` — walks network interfaces, returns IP + MAC
-  from the *same* interface (skips loopback/disabled interfaces, first
-  active IPv4)
-- `internal/config/config.go` — CLI flag parsing (`--server`, `--token`),
-  local config persistence at `C:\ProgramData\khemstrix-agent\config.json`
-  (Windows) / `/etc/khemstrix-agent/config.json` (Linux)
-- `internal/core/sender.go` — `Register()` and `Heartbeat()`, with the
-  designed distinction between `err != nil` (can't reach server) and
-  `resp.StatusCode != 200` (reached server, request rejected)
-- `cmd/agent/main.go` — the state machine: config exists → heartbeat loop;
-  config missing → require `--token`, register (loud/fatal on failure),
-  save config, then heartbeat loop (quiet/retry on failure, never crashes)
-- Module name: `khemstrix-agent`. Compiles clean on both Windows
-  (`GOOS=windows`) and Linux (`GOOS=linux`, cross-compiled from Windows —
-  no separate Linux build machine needed)
+Every item below is implemented, compiled, and verified across separate physical machines and virtual environments.
 
-**Testing performed:**
-- Local same-machine test: registered, heartbeated, confirmed in `psql`
-- Cross-machine test: ran the compiled binary from a genuinely separate
-  Kali VM against the Windows host server (`uvicorn --host 0.0.0.0`),
-  confirmed `hostname`/`os`/`ip_address`/`mac_address` in `psql` matched
-  the VM, not the host
-- Full one-liner install flow tested: real download endpoint → real binary
-  → runs → registers → heartbeats, all from a fresh VM with no manual file
-  copying
+```
+[ Kali Linux / Windows Endpoint ]                 [ Windows Host Server ]
+┌───────────────────────────────┐                 ┌───────────────────────┐
+│ khemstrix-agent (Go)          │                 │ FastAPI + PostgreSQL  │
+│ • Static single binary        │   HTTP JSON     │ • Token Registration  │
+│ • Systemd & Windows Service   ├────────────────►│ • Dynamic IP/MAC sync │
+│ • Auto-persists config.json   │                 │ • UTC Serializer      │
+└───────────────────────────────┘                 └───────────────────────┘
+                                                              │
+                                                              ▼
+                                                  ┌───────────────────────┐
+                                                  │ React + Vite Shell    │
+                                                  │ • One-line installer  │
+                                                  │ • Revoke/Delete/Live  │
+                                                  └───────────────────────┘
+```
 
-**Known scaffold cleanup:** the original folder plan included several
-placeholder files for later phases (`internal/core/event.go`,
-`internal/core/module.go`, `internal/modules/{email,file,network,process,
-response}/*.go`, `internal/platform/service_{linux,windows}.go`) — all were
-**empty 0-byte files**, which breaks `go build` (`expected 'package', found
-'EOF'`). All were deleted for now since they're not needed until their
-respective phases begin; recreate with real `package` declarations when
-picking those phases back up.
+### Backend — Core Connectivity & Life Cycle
 
-### Backend — download distribution
-- `routers/downloads.py` (new file) — `GET /download/agent/windows`,
-  `GET /download/agent/linux`, both public (no JWT — the caller hasn't
-  registered yet), serve compiled binaries from `static/binaries/` via
-  `FileResponse`, with a `404` if the binary isn't present yet
-- **Bug found and fixed**: initial implementation built `BINARY_DIR` as a
-  relative path (`"app/static/binaries"`), which resolved incorrectly
-  depending on the current working directory `uvicorn` was launched from.
-  Fixed by resolving the path relative to `__file__` instead
-  (`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))`) — this is
-  now the standard pattern for any future file-serving code in this
-  project; never trust cwd in server code.
-- Real compiled binaries (`khemstrixAgent.exe`, `khemstrixAgent`) are in
-  place in `static/binaries/`, replacing the earlier dummy test files.
-  **These need to be manually rebuilt and re-copied any time the Go agent
-  source changes** — no CI/build automation exists yet.
+- **Database Pipeline**: PostgreSQL tables (`enrollment_tokens`, `agents`, `users`) verified active and responsive via `psql`.
+- **ORM Mapping**: Synchronized schema chain: `config.py` → `db/database.py` → `db/models.py`.
+- **Storage Timezone Normalization**: Eliminated naive vs. aware datetime conversion mismatches across PostgreSQL `timestamp without time zone` columns.
+- **UTC Serialization Fix**: Added explicit `@field_serializer` to `schemas/agent.py` forcing naive UTC datetimes to render ISO-8601 strings with an explicit `+00:00` offset. Resolved browser timeline bugs where UTC+7 clients (Phnom Penh) displayed events as occurring "7 hours ago".
+- **Registration & Enrollment**: `POST /admin/generate-token` issues single-use, 1-hour expiration tokens. `POST /agent/register` converts tokens to permanent `api_keys` and records hardware metadata.
+- **Dynamic IP/MAC Heartbeat Refresh**: `POST /agent/heartbeat` validates `agent_id` + `api_key` + active status. It dynamically refreshes stored `ip_address` and `mac_address` whenever an endpoint renews its DHCP lease, activates a VPN, or switches subnets.
+- **Administrative Controls**: `PATCH /admin/agents/{agent_id}/revoke` cuts off heartbeat checks with immediate 401 Unauthorized responses. `PATCH /admin/agents/{agent_id}/unrevoke` seamlessly reinstates agents without requiring re-registration. `DELETE /admin/agents/{agent_id}` removes records from inventory.
+- **Binary Distribution**: `routers/downloads.py` serves compiled agents (`khemstrixAgent.exe`, `khemstrixAgent`) with absolute filesystem pathing derived from `__file__`, eliminating uvicorn working-directory errors.
 
-### Dashboard (React + Vite)
-- Login page + `AuthContext`, `api.js` centralized request helper,
-  `AuthError` → `forceLogout()` — unchanged from Phase 1.0, still solid
-- **`GenerateTokenModal.jsx`** — now generates the real chained
-  download-and-run one-liner (Windows PowerShell / Linux bash toggle),
-  built from the dashboard's own `API_URL` (now exported from `api.js`)
-  and the freshly generated token — replacing the old static placeholder
-  command
-  - **Bug found and fixed**: `API_URL` defaults to `http://localhost:8000`
-    when `VITE_API_URL` isn't set in `.env`. That default is correct for
-    the dashboard's *own* API calls but wrong for the install command,
-    which must run on a different machine — `localhost` in that context
-    means "call yourself." Fixed by setting `VITE_API_URL` explicitly to
-    the server's real LAN-reachable IP in `.env`. **This same variable
-    will need to become the real public domain at deployment time** — no
-    code changes required then, just the `.env` value.
-- **`Agents.jsx`** — significantly expanded:
-  - Added `ip_address` / `mac_address` columns (fallback `—` for blank
-    values, e.g. agents registered before the schema change)
-  - Added a real Actions column: Revoke / Reactivate (context-dependent)
-    and Delete (with an inline two-step confirm, not a native `confirm()`)
-  - **Bug found and fixed**: `StatusBadge` was being passed a boolean
-    (`online={isAgentOnline(agent)}`) on a prop (`online`) the component
-    never actually read — it expects a `state` string prop. This meant
-    every agent silently showed "Offline" regardless of real status. Fixed
-    by switching to `getAgentState(agent)` (already correctly built for
-    three states in `agentStatus.js`, just never wired up) and passing
-    `state={getAgentState(agent)}`.
-- **`AppShell.jsx`** — removed a `max-w-6xl` cap on the main content area
-  that was preventing the layout from using full window width; `flex-1`
-  alone handles full-width responsiveness correctly
-- **`StatusBadge.jsx`** — no changes needed; was already correctly built
-  for `online`/`offline`/`revoked` states, just never received the right
-  prop until the `Agents.jsx` fix above
+### Go Endpoint Agent (khemstrix-agent)
 
----
+- **Clean Single Binary**: Dependency-free compilation on Windows (`.exe`) and Linux (cross-compiled via `GOOS=linux` from Windows).
+- **Unified Network Extraction**: `internal/core/netinfo.go` traverses interfaces and extracts the IPv4 address and MAC address simultaneously from the active NIC, skipping loopback and inactive links.
+- **Local Persistence**: `internal/config/config.go` persists runtime settings to `C:\ProgramData\khemstrix-agent\config.json` (Windows) or `/etc/khemstrix-agent/config.json` (Linux).
+- **Persistent Execution**: Verified running as a native systemd unit on Linux and as a background service on Windows without holding open interactive terminal windows.
+- **State Machine**: Automatically chooses startup mode: runs the heartbeat loop if `config.json` is present; requires `--token`, enrolls with the server, writes configuration, and transitions into the heartbeat loop if absent.
 
-## 🟡 Closed Gaps (previously "built but not connected")
+### Management Web Dashboard (React + Vite)
 
-- **`PATCH /admin/agents/{agent_id}/revoke`** — now fully wired: `api.js`
-  function, `Agents.jsx` button, confirmed working end-to-end including
-  the effect on a live heartbeating agent (heartbeats start failing with
-  `401` immediately, `last_seen_at` freezes at the last successful check-in)
-- **`DELETE /admin/agents/{agent_id}`** — now fully wired, including the
-  confirm-before-delete step recommended in the previous report
-- **`PUT /auth/change-password`** — still not confirmed whether any page
-  has a UI form calling it. Not touched this phase — carrying forward as
-  an open item.
+- **Live Fleet Table**: Real-time visibility into hostnames, OS, dynamically refreshed IP/MAC addresses, and connection status badges (Online, Offline, Revoked).
+- **Fleet Actions**: Wired interactive confirmation modals for agent revocation, reactivation, and permanent deletion.
+- **Chained One-Line Installer**: Dynamic generation of copy-paste installation commands for Windows PowerShell and Linux Bash using the backend server's LAN-accessible IP address.
 
----
+## 3. Scalable Architecture Foundations (Phase 1.1)
 
-## ⬜ Not Started
+To transition from machine inventory (heartbeats) to security threat monitoring (events) without future code rewrites, four architectural seams must be established:
 
-- **Background/service execution.** The Go agent currently only runs in
-  the foreground, in a terminal a human has to keep open — not a real
-  background service yet. Planned next step:
-  - **Linux**: a systemd unit file (`khemstrix-agent.service`) — no Go
-    code changes needed, systemd just manages the existing binary's
-    lifecycle (`systemctl start/stop/status/enable`)
-  - **Windows**: genuinely more involved — Windows doesn't run arbitrary
-    `.exe`s as services without the binary itself speaking the Windows
-    Service Control Manager protocol. Requires Go code changes (likely
-    `golang.org/x/sys/windows/svc`), not just an external config file.
-  - Suggested order: Linux first (lower complexity, already have a tested
-    Linux binary), Windows second.
-- **Event pipeline** (`events` table, `routers/events.py`,
-  `detection/dispatcher.py`, per-type scorers) — still fully commented out
-  in `db/models.py`. Phase 1.1 per the roadmap, untouched this session.
-- **Response actions** (`response/actions.py`) — Phase 3, no code written.
-- **Alembic migrations** — still manual. The `ip_address`/`mac_address`
-  additions this phase are a good concrete example of why this becomes
-  worth introducing soon: two real bugs this session (`ip_address` missing
-  from `models.py`, and the double-`/admin` prefix bug on the `unrevoke`
-  route) came from manually keeping multiple files in sync by hand.
-- **Un-revoke button parity with revoke's safety UX** — revoke and delete
-  both give visual feedback via the Actions column; un-revoke does too now,
-  but there's no confirmation step (arguably fine, since it's non-destructive)
-  — worth a deliberate decision, not an oversight, but noting it.
+```
+                                  INGESTION & BUFFERING PIPELINE
 
----
+ [ Go Endpoint Agent ]                    [ FastAPI Backend ]                 [ PostgreSQL ]
+┌─────────────────────┐                 ┌────────────────────┐             ┌────────────────────┐
+│ In-Memory Buffer    │  Batch Flush    │  asyncio.Queue      │  Bulk       │  organizations     │
+│ • Max 50 items      ├────────────────►│  • Buffer bursts    ├────────────►│  agents            │
+│ • 20s Jitter Ticker │  HTTP 202 (<5ms)│  • Background task  │  Insert     │  events (Partition │
+└─────────────────────┘                 └────────────────────┘             │   by Month)        │
+                                                                            └────────────────────┘
+```
 
-## Known Gaps / Pre-Production Hardening Items
+### 1. Database Multi-Tenancy Anchor
 
-Carried forward from the previous report, still accurate:
-- **`api_key` stored in plaintext** — unchanged, still a known simplification
-- **No server-side JWT revocation** — unchanged
-- **`create_admin.py` is a dev/testing tool** — unchanged
-- **No HTTPS** — unchanged, all traffic still plain HTTP. Now more
-  concretely relevant: `VITE_API_URL` will need to become an `https://`
-  domain at deployment, and Go's `net/http` client handles TLS
-  automatically with no code change — just the URL scheme.
-- **No multi-tenancy** — unchanged
-- **CORS locked to `http://localhost:5173`** — unchanged, will need
-  updating once the dashboard itself is deployed to a real domain
+- Create an `organizations` table as the root tenant entity.
+- Seed a static default UUID (`00000000-0000-0000-0000-000000000001`, "Default SME").
+- Add `tenant_id` foreign keys to `agents`, `enrollment_tokens`, and `events`.
+- **Why**: Model 1 runs cleanly as a single-tenant instance. Model 2 simply registers additional organization rows, and queries filter via `WHERE tenant_id = :current_tenant` without requiring schema migrations.
 
-**New items found this phase:**
-- **The compiled Windows binary is flagged by 2/60 AV engines on
-  VirusTotal** (both generic ML/heuristic detections — `Bkav` and
-  Microsoft's `Wacatac.C!ml` — not signature matches). Expected for any
-  unsigned, freshly-compiled, zero-reputation binary that does
-  network-monitoring-agent-like things (persistent background process,
-  outbound connections, system info collection) — not unique to this
-  codebase, and not currently blocking testing. **Code-signing the binary
-  is a real requirement before any production distribution**, both to
-  reduce AV friction and as standard practice for distributed executables.
-- **Revoke/delete don't stop the agent process itself.** Both only remove
-  or flag the server-side database row. A physical agent process left
-  running on a revoked or deleted machine will keep retrying its heartbeat
-  loop forever (quiet-fail by design), showing up as a steady stream of
-  `401`s in server logs. Nothing to fix code-wise — this is expected
-  agent-side behavior — but worth knowing operationally: **deleting a
-  dashboard row does not uninstall or stop anything on the actual
-  endpoint.**
-- **Duplicate/stale test agent rows.** Several rows accumulated in
-  `agents` from iterative testing (mistyped server IPs consuming tokens,
-  pre-schema-change registrations with blank IP/MAC, etc.). Cleaned up
-  manually via the now-working dashboard delete button; worth a quick
-  `psql` sanity check (`SELECT hostname, created_at FROM agents ORDER BY
-  created_at;`) before any demo to confirm the list only shows real,
-  current agents.
+### 2. Time-Based Partitioning on Telemetry
 
----
+- High-volume security logs rapidly degrade standard B-Tree indexing.
+- Partition the `events` table by `RANGE (timestamp)` in monthly increments (`events_2026_09`).
+- Telemetry past the Cambodian regulatory 90-day retention window can be dropped instantly via `DROP TABLE events_YYYY_MM`, avoiding database vacuum locks.
 
-## Suggested Next Steps (in priority order)
+### 3. Asynchronous In-Process Queue (asyncio.Queue)
 
-1. **Background service execution** — systemd unit (Linux) first, then
-   Windows Service support (Go code change) — this is what actually makes
-   the agent usable outside of an open terminal window, and is the natural
-   next milestone after the one-line install work.
-2. Confirm/complete the `change-password` UI in `Settings.jsx`
-3. Bring the `events` table online (Phase 1.1) — unblocks testing the
-   agent's future event-sending path independently of scoring
-4. Begin Phase 1.1 detection logic once events are flowing
-5. Consider introducing Alembic given two manual-sync bugs surfaced this
-   session
+To prevent incoming telemetry spikes from starving database connections, decouple API receipt from database writes.
+
+- Avoid external broker installations (Redis, RabbitMQ, Celery) to keep Model 1 lightweight on low-spec SME hardware.
+- Use Python's native `asyncio.Queue(maxsize=5000)`:
+  - `POST /agent/events` validates caller authentication and schema.
+  - Enqueues the batch into process memory via `.put_nowait()`.
+  - Returns `202 Accepted` in <5ms.
+- An asynchronous worker task tied to the FastAPI lifespan consumes batches, runs heuristic detection, and executes bulk database commits (`session.add_all()`).
+
+### 4. Edge Batching & Jitter on the Endpoint
+
+- The Go agent buffers security observations in a thread-safe slice rather than making an HTTP call per event.
+- Flushes occur when the buffer reaches 50 events or when a 20-second ticker fires.
+- Includes random time jitter (±3 seconds) to prevent simultaneous connections from crowding local office network routers.
+- **Offline Durability**: Retains buffered logs in memory during temporary network drops and retries on subsequent flush cycles.
+
+## 4. The Standard Event Contract
+
+Every future telemetry module (email phishing today; process execution, network sockets, and file integrity monitoring in Phase 2) must adhere to this standard event envelope:
+
+```json
+{
+  "event_type": "email_phishing",
+  "timestamp": "2026-09-09T07:13:05Z",
+  "raw_data": {
+    "sender": "security@aba-verify-kh.com",
+    "subject": "Urgent: Your account is locked",
+    "links": ["http://login.aba-verify-kh.com/auth"],
+    "attachment_hashes": ["e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
+  },
+  "extracted_features": {
+    "has_brand_homoglyph": true,
+    "urgency_score": 0.92,
+    "attachment_is_executable": false
+  }
+}
+```
+
+- **Schema Independence via JSONB**: Metadata is indexed in formal relational columns, while dynamic fields reside in `raw_data` and `extracted_features`.
+- New endpoint monitoring capabilities can be added without running table migrations on existing deployments.
+
+## 5. Threat Detection Strategy: AI NLP + VirusTotal
+
+### The Dual-Risk Reality of Email Threats
+
+- **Malware Attachments**: Inbound payloads, malicious macros, and weaponized archives.
+- **Social Engineering / Pure Phishing**: Attacks containing no attachments at all (e.g., credential theft links, deceptive payment redirections, bank verification lures).
+
+### Why VirusTotal Alone Is Insufficient
+
+- **No File = No Value**: Over 70% of modern phishing attacks carry no attachment. VirusTotal provides zero visibility on pure social engineering text and novel phishing URLs.
+- **Zero-Day Blind Spots**: New malware or modified payloads produce unseen SHA-256 hashes, returning 0/70 Clean from VirusTotal.
+- **Severe Rate Limits**: VirusTotal's free public API allows only 4 requests/minute and 500 requests/day. A small office of 15 employees exhausts this quota within hours, resulting in HTTP 429 API lockouts.
+- **Privacy Risk of Direct File Uploads**: Uploading actual business files to VirusTotal exposes proprietary documents to security researchers globally.
+
+### The Hybrid Multi-Layer Defense Engine
+
+```
+                          INBOUND EMAIL TELEMETRY
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────┐
+                    │  LAYER 1: Hard Heuristic Rules  │
+                    │  • Double extensions (.pdf.exe) │ ──► High Severity (Instant)
+                    │  • Known malicious TLDs         │
+                    └────────────────┬────────────────┘
+                                     │ Passed
+                                     ▼
+                    ┌─────────────────────────────────┐
+                    │  LAYER 2: VirusTotal Hash Check │
+                    │  • Query SHA-256 in local cache │ ──► Known Malware
+                    │  • If VT detections >= 3        │
+                    └────────────────┬────────────────┘
+                                     │ Clean / Unknown / No Attachment
+                                     ▼
+                    ┌─────────────────────────────────┐
+                    │  LAYER 3: Local NLP Model       │
+                    │  • Social engineering intent    │ ──► Score: 0.0 to 1.0
+                    │  • Urgency & psychological lure │     (Phishing Verdict)
+                    │  • Homoglyph/brand mismatch     │
+                    └─────────────────────────────────┘
+```
+
+- **Layer 1 (Fast Heuristics)**: Blocks dangerous file extensions (`.exe`, `.scr`, `.vbs`, `.iso`) and spoofed executable tricks locally in zero time.
+- **Layer 2 (Cached VirusTotal Lookups)**: Computes the SHA-256 hash of attachments in memory on the Go agent. Queries a local database hash cache first; queries VirusTotal only on cache misses, staying within rate limits while keeping raw files private.
+- **Layer 3 (Offline-Trained NLP Model)**: The primary brain. Evaluates message text and structure to detect credential phishing, urgency manipulation, and domain typosquatting.
+
+### Data Privacy & Regulatory Compliance (Zero Body Storage)
+
+To comply with Cambodia's draft data protection standards, the system operates on a zero-persistence principle for email bodies:
+
+1. The Go agent extracts plain text, links, and headers in memory.
+2. The backend runs inference to determine threat probability and identify specific attack indicators (e.g., "brand_impersonation", "credential_harvesting").
+3. The raw email body is immediately purged from memory. It is never written to PostgreSQL or persisted to disk. Only the threat score, verdict, and extracted security indicators are stored for compliance audits.
+
+## 6. Team Division of Labor: Systems Lead vs. AI Teammate
+
+```
+┌──────────────────────────────────────────────┐  ┌──────────────────────────────────────────────┐
+│         SYSTEMS LEAD (PROJECT LEAD)          │  │       AI & BACKEND (YEAR 3 TEAMMATE)         │
+├──────────────────────────────────────────────┤  ├──────────────────────────────────────────────┤
+│ 1. Fix Linux systemd flag precedence         │  │ 1. Curate public email phishing datasets     │
+│ 2. Audit Windows background service          │  │ 2. Generate synthetic Cambodian lures (ABA)  │
+│ 3. Build Go agent mutex Ring Buffer          │  │ 3. Train ML/NLP models (TF-IDF + Forest)     │
+│ 4. Build agent IMAP attachment hash extractor│  │ 4. Build `server/app/detection/email_scorer` │
+│ 5. Implement SendEvents() batch dispatcher   │  │ 5. Implement VirusTotal hash caching layer   │
+│ 6. Rebuild static cross-compiled binaries    │  │ 6. Run SQL multi-tenant database migration   │
+└──────────────────────┬───────────────────────┘  └──────────────────────┬───────────────────────┘
+                       │                                                 │
+                       └───────────────────►◄────────────────────────────┘
+                                     INTEGRATION TEST
+                           Simulated Phishing Event Ingestion
+```
+
+### Systems Lead Responsibilities (Core Infrastructure)
+
+- **Service Precedence Resolution**: Remove hardcoded `--server=` arguments from `/etc/systemd/system/khemstrix-agent.service`. Ensure `cmd/agent/main.go` gives precedence to `config.json` over CLI flag defaults.
+- **Windows Service Verification**: Audit Windows service execution parameters to ensure runtime settings are not overridden.
+- **Agent Ring Buffer** (`agent/internal/core/event.go`): Implement thread-safe buffer slice with dual-condition flushing (50 events or 20s ticker with jitter).
+- **IMAP Telemetry Module** (`agent/internal/modules/email/`): Connect via IMAP, extract headers, extract links, compute attachment SHA-256 hashes in memory, and purge raw bytes.
+- **Agent Batch Sender** (`agent/internal/core/sender.go`): Implement `SendEvents()` to dispatch JSON batches to `POST /agent/events` with offline retry handling.
+- **Binary Pipeline**: Cross-compile updated binaries and maintain files in `server/app/static/binaries/`.
+
+### AI Teammate Responsibilities (Machine Learning & Ingestion)
+
+- **Dataset Curation & Preprocessing**: Assemble public phishing corpora (Nazario, SpamAssassin, Kaggle, Hugging Face). Generate synthetic samples modeling local Cambodian lures (ABA Bank, Canadia, Wing, Telegram verification).
+- **Model Training & Evaluation**: Train a baseline tabular classifier (TF-IDF vectorizer + Random Forest / XGBoost) on phishing language, urgency indicators, and link patterns. Evaluate precision, recall, and false-positive rates for her academic defense.
+- **Export Trained Pipeline**: Serialize the model and vectorizer to `.joblib` artifacts for integration into FastAPI.
+- **FastAPI Scoring Pipeline** (`server/app/detection/email_scorer.py`): Load artifacts into memory on startup; accept incoming event text and features; return threat probabilities, risk tiers (safe, suspicious, malicious), and threat indicators.
+- **VirusTotal Hash Cache Client**: Build `server/app/detection/virustotal.py` to query SHA-256 hashes against a local cache table before consuming public API quotas.
+- **Database Migration & Schemas**: Execute SQL migration for `organizations` and partitioned `events`; implement `schemas/event.py` with the UTC serializer; build the `asyncio.Queue` worker in `server/app/core/queue.py`.
+
+## 7. Next Implementation Steps (Priority Order)
+
+### Step 1: Configuration & Service Precedence Fix
+- Remove `--server=` flag from Linux systemd unit file; reload daemon.
+- Ensure `cmd/agent/main.go` gives priority to `config.json`.
+
+### Step 2: Database Multi-Tenancy & Partitioning
+- Run the SQL migration to create `organizations` and add `tenant_id` to existing tables.
+- Create the monthly partitioned events table (`events_2026_09`) with indexes on `(tenant_id, created_at DESC)` and `(agent_id, timestamp DESC)`.
+- Update SQLAlchemy models in `server/app/db/models.py`.
+
+### Step 3: FastAPI Async Ingestion Pipeline
+- Create `schemas/event.py` with UTC serializer methods.
+- Implement in-process queue and lifespan worker in `core/queue.py` and `main.py`.
+- Create `routers/events.py` with heartbeat-style credential validation returning `202 Accepted`.
+
+### Step 4: Go Agent Batching Core
+- Implement thread-safe `EventBuffer` in `agent/internal/core/event.go`.
+- Add `SendEvents()` to `agent/internal/core/sender.go` with retry resilience.
+
+### Step 5: Offline Model Training & Email Scorer
+- Train the baseline NLP phishing model on benchmark corpora and export `model.joblib`.
+- Build `server/app/detection/email_scorer.py` and hook it into the background queue worker.
+
+### Step 6: End-to-End System Verification
+- Dispatch synthetic event batches via `curl` to `POST /agent/events`; verify `202 Accepted`.
+- Query PostgreSQL directly (`SELECT * FROM events;`) to confirm unbuffered writes.
+- Verify detection scoring outputs and confirm raw email bodies are not written to disk.

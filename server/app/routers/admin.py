@@ -12,6 +12,7 @@ from schemas.token import TokenResponse
 from schemas.agent import AgentActionResponse
 from core.deps import get_current_user_id
 from core.deps import get_current_user_id
+from core.constants import DEFAULT_TENANT_ID
 
 router = APIRouter()
 
@@ -30,8 +31,9 @@ async def generate_token(
 
     token_row = EnrollmentToken(
         token=new_token,
-        expires_at=expires_at_naive,   # store the naive version
+        expires_at=expires_at_naive,
         used=False,
+        tenant_id=DEFAULT_TENANT_ID,   # add this line
     )
     db.add(token_row)
 

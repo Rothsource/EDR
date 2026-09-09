@@ -374,6 +374,62 @@ or a small always-reachable "redirect" endpoint the agent checks before
 each heartbeat, would remove the need for manual file edits — noted as a
 possible improvement, not yet implemented.
 
+### 3.5 Windows binary downloaded/built fine, but running it fails with
+"The specified executable is not a valid application for this OS platform"
+
+**Symptom:**
+```
+Program 'khemstrixAgent.exe' failed to run: The specified executable is
+not a valid application for this OS platform.
+```
+The file exists, has the right name and `.exe` extension, downloaded or
+copied without error — it just won't launch.
+
+**Cause:** the file is not actually a Windows PE executable, despite its
+name. Go builds for whatever `GOOS`/`GOARCH` are currently set in the
+shell — it does **not** infer the target platform from the output
+filename. If a Linux build (`GOOS=linux go build -o khemstrixAgent`) was
+run and then, in the same or a related terminal/CI step, a build intended
+for Windows used the same base name with `.exe` appended without
+explicitly re-setting `GOOS=windows` first, the result is a Linux ELF
+binary wearing a Windows filename. Go builds it successfully and produces
+a file — there's no error at build time, since Go has no way to know the
+filename implies a platform mismatch.
+
+**Confirm this is the cause:**
+On a Linux/WSL machine (or via `file` if available):
+```bash
+file khemstrixAgent.exe
+```
+`ELF 64-bit LSB executable` confirms it's actually a Linux binary. A
+correct Windows binary reports `PE32+ executable (console) x86-64, for MS
+Windows`.
+
+On Windows itself (no `file` command available), check the first two
+bytes — every valid Windows PE binary starts with `MZ`:
+```powershell
+Get-Content .\khemstrixAgent.exe -Encoding Byte -TotalCount 2 | ForEach-Object { [char]$_ }
+```
+Should print `MZ`. Anything else means it's not a valid Windows
+executable.
+
+**Fix — rebuild explicitly, setting `GOOS`/`GOARCH` in the same command
+as the build** rather than exporting them separately and relying on
+remembering to reset:
+```powershell
+$env:GOOS="windows"; $env:GOARCH="amd64"; go build -o khemstrixAgent.exe .\cmd\agent
+```
+Re-verify with the `MZ` check above before distributing it. Then replace
+the bad file in `server/app/static/binaries/khemstrixAgent.exe`.
+
+**Prevention:** always build both platform binaries as fully separate,
+explicit commands rather than relying on a previously-set environment
+variable from earlier in the session:
+```powershell
+GOOS=windows GOARCH=amd64 go build -o khemstrixAgent.exe ./cmd/agent
+GOOS=linux GOARCH=amd64 go build -o khemstrixAgent ./cmd/agent
+```
+
 ---
 
 ## 4. Cross-Machine / VM Testing Problems
@@ -471,7 +527,68 @@ window size.
 
 ---
 
-## 6. General Debugging Habits Worth Keeping
+## 6. Windows Endpoint Problems (agent host machine, not the dev machine)
+
+### 6.1 Can't save edits to `config.json` under `ProgramData` — Notepad
+opens it fine but Save silently does nothing, or errors with "Access is
+denied"
+
+**Symptom:** `C:\ProgramData\khemstrix-agent\config.json` opens for
+viewing normally (double-click, or File → Open in a regular Notepad
+window), but editing and saving fails — either silently, or with an
+explicit permissions error.
+
+**Two independent causes, check both:**
+
+**Cause A — `ProgramData` is an admin-protected folder.** Standard user
+write access to files under `C:\ProgramData\` is restricted by default.
+A non-elevated Notepad (which is what you get by double-clicking the file
+in Explorer, or launching Notepad normally) can read the file but Windows
+blocks the write-back.
+
+**Fix — run Notepad elevated:**
+```powershell
+Start-Process notepad "$env:ProgramData\khemstrix-agent\config.json" -Verb RunAs
+```
+Accept the UAC prompt. This opens the file directly, pre-elevated, so
+Ctrl+S works normally from there.
+
+**Alternative (GUI-only, no PowerShell needed):** Start Menu → search
+`Notepad` → right-click the result → **Run as administrator** → accept
+UAC → then use **File → Open** inside that elevated window to browse to
+the file. Double-clicking the file itself from Explorer will still open a
+non-elevated instance and fail to save, regardless of this fix — the
+elevation has to happen at the point Notepad itself launches.
+
+**Permanent fix, so double-click works normally afterward:** grant your
+user account **Modify**/**Write** permissions on the folder directly —
+right-click `C:\ProgramData\khemstrix-agent` → Properties → Security tab →
+Edit... → select your account (Add... if not listed) → check **Modify**
+and **Write** under Allow → OK. After this, no elevation is needed for
+future edits.
+
+**Cause B — the file is locked by the running agent process.** If
+`khemstrixAgent.exe` is currently running (foreground terminal, background
+process, or — once built — as a service), it may hold the config file open
+in a way that blocks external writes, depending on how the agent reads it.
+
+**Fix — stop the process before editing, restart after:**
+```powershell
+Stop-Process -Name khemstrixAgent -Force -ErrorAction SilentlyContinue
+Get-Process khemstrixAgent -ErrorAction SilentlyContinue   # should return nothing — confirms it's stopped
+# ... edit and save config.json here (with elevated Notepad, per Cause A) ...
+& "$env:ProgramData\khemstrix-agent\khemstrixAgent.exe"    # no flags needed — reloads from the edited config
+```
+
+**Diagnostic tip:** if save fails with no visible error at all (rather
+than an explicit "Access is denied" dialog), suspect Cause A first — a
+silent failure is Notepad's typical behavior when Windows blocks the
+write due to permissions, rather than a file lock, which usually surfaces
+a more explicit "being used by another process" message.
+
+---
+
+## 7. General Debugging Habits Worth Keeping
 
 - **When in doubt about whether something was actually persisted, query
   Postgres directly.** `/docs` and API responses can look correct while
@@ -484,6 +601,11 @@ window size.
 - **When a Go build fails on one empty file, check for others before
   fixing them one at a time** — `Get-ChildItem -Recurse -Filter *.go |
   Where-Object { $_.Length -eq 0 }` finds every empty stub in one pass.
+- **Never trust a binary's filename to confirm its platform.** Go builds
+  for whatever `GOOS`/`GOARCH` are currently set, regardless of the output
+  filename you choose — always verify with the `MZ`-header check (Windows)
+  or `file` (Linux) before distributing, especially after cross-compiling
+  both platforms in the same terminal session (see §3.5).
 - **Revoking or deleting an agent server-side never stops the actual
   process on the endpoint.** If you need a physical machine to stop
   heartbeating, you have to act on that machine directly (kill the
@@ -502,3 +624,7 @@ window size.
   look identical to a firewall or VM networking problem — check whether
   the server's IP actually changed first (§3.4) before re-diagnosing VM
   networking from scratch (§4.2).
+- **On Windows endpoints, a config edit that "doesn't save" is almost
+  always permissions, not corruption.** Check elevation first (§6.1)
+  before assuming the file itself or the agent's config-parsing logic is
+  broken.

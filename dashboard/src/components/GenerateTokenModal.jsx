@@ -46,9 +46,13 @@ export default function GenerateTokenModal({ onClose }) {
   function buildInstallCommand() {
     if (!token) return "";
     if (os === "windows") {
+      <p className="text-xs text-warning flex items-center gap-1 mb-2">
+        <span className="material-symbols-outlined text-[14px]">warning</span>
+        Must be run in an elevated (Administrator) PowerShell window
+      </p>
       return `Invoke-WebRequest -Uri "${API_URL}/download/agent/windows" -OutFile "$env:TEMP\\khemstrixAgent.exe"; & "$env:TEMP\\khemstrixAgent.exe" --server=${API_URL} --token=${token}`;
     }
-    return `curl -o /tmp/khemstrixAgent ${API_URL}/download/agent/linux && chmod +x /tmp/khemstrixAgent && /tmp/khemstrixAgent --server=${API_URL} --token=${token}`;
+    return `curl -o /tmp/khemstrixAgent ${API_URL}/download/agent/linux && chmod +x /tmp/khemstrixAgent && sudo /tmp/khemstrixAgent --server=${API_URL} --token=${token}`;
   }
 
   function copyCommand() {

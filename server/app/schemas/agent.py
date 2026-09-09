@@ -42,6 +42,8 @@ class AgentRegisterResponse(BaseModel):
 class AgentHeartbeat(BaseModel):
     agent_id: UUID
     api_key: str
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
     
 class AgentActionResponse(BaseModel):
     status: str

@@ -22,8 +22,10 @@ type RegisterResponse struct {
 }
 
 type HeartbeatRequest struct {
-	AgentID string `json:"agent_id"`
-	APIKey  string `json:"api_key"`
+	AgentID    string `json:"agent_id"`
+	APIKey     string `json:"api_key"`
+	IPAddress  string `json:"ip_address,omitempty"`
+	MACAddress string `json:"mac_address,omitempty"`
 }
 
 type errorResponse struct {

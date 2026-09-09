@@ -41,7 +41,14 @@ func main() {
 	flags := config.Flags{Server: *server, Token: *token}
 
 	svcConfig := platform.Config()
-	svcConfig.Arguments = flagArgs // baked in for every future automatic restart
+	// Do NOT bake CLI flags into the OS service definition. Leaving
+	// Arguments empty ensures systemd and Windows SCM run the bare binary,
+	// so config.json remains the authoritative source of truth across
+	// reboots. This means the service process can NEVER perform first-time
+	// registration itself (it never has --server/--token) — registration
+	// must happen in the foreground, in autoInstallAndStart, before the
+	// service is ever installed/started. See core.RegisterAndSaveConfig.
+	svcConfig.Arguments = []string{}
 
 	prg := platform.NewProgram(func(ctx context.Context) error {
 		return core.Run(ctx, flags)
@@ -52,10 +59,7 @@ func main() {
 		log.Fatalf("failed to initialize service: %v", err)
 	}
 
-	// service.Interactive() is the key check: false means the OS service
-	// manager (systemd/SCM) launched us — this happens on every boot and
-	// every crash-recovery restart. In that case we must NEVER try to
-	// self-install again — just run the actual agent loop.
+	// service.Interactive() is false when launched by systemd or Windows SCM.
 	if !service.Interactive() {
 		if err := svc.Run(); err != nil {
 			log.Fatalf("service run error: %v", err)
@@ -63,11 +67,8 @@ func main() {
 		return
 	}
 
-	// From here down: a human ran this binary directly.
-
+	// From here down: an operator ran this binary directly from a terminal.
 	if action != "" {
-		// Explicit manual control — still available for you as the admin,
-		// but customers never need to type these.
 		switch action {
 		case "install", "uninstall", "start", "stop":
 			if err := service.Control(svc, action); err != nil {
@@ -80,26 +81,37 @@ func main() {
 		return
 	}
 
-	if *server == "" || *token == "" {
+	// Check whether the agent has already been registered on this host —
+	// AND, if the operator passed a --server flag this run, that it still
+	// points at the same server. A flag that disagrees with the saved
+	// config means the operator wants to re-point/re-register this agent,
+	// not silently keep running against whatever it was registered to
+	// before.
+	existingCfg, cfgErr := config.Load()
+	hasValidExistingConfig := cfgErr == nil && existingCfg != nil &&
+		existingCfg.AgentID != "" && existingCfg.APIKey != ""
+	serverMatches := *server == "" || (hasValidExistingConfig && existingCfg.Server == *server)
+	hasExistingConfig := hasValidExistingConfig && serverMatches
+
+	if hasValidExistingConfig && !serverMatches {
+		fmt.Printf("Existing registration found for %s, but --server=%s was passed — re-registering against the new server.\n", existingCfg.Server, *server)
+	}
+
+	// Only require flags for fresh, unregistered (or re-pointed) installations.
+	if !hasExistingConfig && (*server == "" || *token == "") {
 		fmt.Println("usage: khemstrix-agent --server=<url> --token=<token>")
 		fmt.Println("       (installs and starts itself as a background service automatically)")
 		fmt.Println("advanced: khemstrix-agent install|uninstall|start|stop|status")
 		os.Exit(1)
 	}
 
-	// This is the one-shot, no-further-commands-needed setup path.
-	if err := autoInstallAndStart(svc, svcConfig); err != nil {
+	if err := autoInstallAndStart(svc, flagArgs, flags, hasExistingConfig); err != nil {
 		fmt.Printf("Setup failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// autoInstallAndStart does everything in one call: relocate the binary
-// somewhere permanent (so it survives /tmp being wiped on reboot), install
-// it as a real OS service, start it, then poll for real proof of
-// connectivity before reporting success — matching exactly what a customer
-// running the one-liner needs, with zero further commands.
-func autoInstallAndStart(svc service.Service, svcConfig *service.Config) error {
+func autoInstallAndStart(svc service.Service, flagArgs []string, flags config.Flags, hasExistingConfig bool) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("could not determine own path: %w", err)
@@ -116,10 +128,9 @@ func autoInstallAndStart(svc service.Service, svcConfig *service.Config) error {
 			os.Chmod(target, 0755)
 		}
 
-		// Hand off to the permanently-installed copy with the same
-		// arguments, so kardianos/service registers the SERVICE pointing
-		// at the permanent path, not this temporary one.
-		cmd := exec.Command(target, os.Args[1:]...)
+		// Hand off to the installed copy with the original CLI arguments
+		// so it can complete registration and trigger initial service creation.
+		cmd := exec.Command(target, flagArgs...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
@@ -129,8 +140,23 @@ func autoInstallAndStart(svc service.Service, svcConfig *service.Config) error {
 		return nil
 	}
 
-	// We're already running from the permanent location — do the real work.
+	// Already running from the permanent location.
+	// Register now, in the foreground, if we don't already have valid
+	// config for the requested server. This has to happen here — the
+	// service is about to be launched with zero CLI arguments, so this
+	// is the only point in the whole flow where flags.Server/flags.Token
+	// are actually available to perform registration.
+	if !hasExistingConfig {
+		fmt.Println("Registering with the server...")
+		if _, err := core.RegisterAndSaveConfig(flags.Server, flags.Token); err != nil {
+			return fmt.Errorf("registration failed: %w", err)
+		}
+		fmt.Println("Registered successfully.")
+	}
+
 	fmt.Println("Registering as a background service...")
+	// If the service is already installed, reinstall to clear out old baked arguments.
+	_ = service.Control(svc, "uninstall")
 	if err := service.Control(svc, "install"); err != nil {
 		return fmt.Errorf("service install failed: %w", err)
 	}
@@ -152,7 +178,7 @@ func autoInstallAndStart(svc service.Service, svcConfig *service.Config) error {
 		}
 	}
 
-	return fmt.Errorf("installed and started, but no successful check-in yet — run `%s status` to check, or re-run this binary directly (without install) to see live errors", target)
+	return fmt.Errorf("installed and started, but no successful check-in yet — run `%s status` to check, or inspect service logs", target)
 }
 
 func persistentInstallPath() string {

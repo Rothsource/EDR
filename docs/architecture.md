@@ -92,6 +92,17 @@ input/output independently of whether the ORM layer actually persists it.
 direct `SELECT` against the real table as the actual proof a new field
 works — not a clean-looking `/docs` response.
 
+**Same lesson, opposite failure mode, hit again this phase:** when
+`tenant_id` was added to `agents` and `enrollment_tokens` as `NOT NULL` in
+Postgres before `db/models.py` and the router insert calls were updated to
+match, the failure mode flipped from "silently dropped" to "hard crash" —
+every `POST /agent/register` and `POST /admin/generate-token` call raised
+an `IntegrityError` until all three layers were brought back in sync. Both
+directions point at the same rule: **a schema change isn't done until
+Postgres, `models.py`, `schemas/*.py`, and the router insert/update calls
+all agree** — checking only one or two of them can look fine and still be
+broken.
+
 ---
 
 ## 3. Authentication Model — Two Different Kinds of "Identity"
@@ -116,7 +127,7 @@ lifespans:
 ```
 1. Admin generates a one-time enrollment token
       POST /admin/generate-token   (protected — requires admin JWT)
-      → random token, valid 1 hour, single-use
+      → random token, valid 1 hour, single-use, tagged with tenant_id
 
 2. Token is handed to the new machine — now via the real one-line
    install command generated in GenerateTokenModal.jsx, which
@@ -131,6 +142,7 @@ lifespans:
         - rejects if missing / expired / already used
         - generates a NEW random api_key (secrets.token_urlsafe(32))
         - creates the Agent row, storing that api_key + ip/mac address
+          + tenant_id (see 3.5 below)
         - marks the enrollment token as used (can't be reused)
         - returns { agent_id, api_key } — the ONE TIME the api_key
           is ever sent back to a client
@@ -220,6 +232,11 @@ agents, which do have a revoke *and* un-revoke mechanism — see 3.4.)
 one-time script (`create_admin.py`), run manually — a development tool,
 not a production onboarding flow.
 
+**Not yet tenant-scoped:** `users` has no `tenant_id` column yet. The JWT's
+`sub` claim identifies *which admin* is logged in, but nothing about
+*which organization* they belong to. See 3.5 for why this matters and what
+still needs to change before Model 2.
+
 ### 3.3 How the dashboard uses the JWT and the server address
 
 `dashboard/src/api.js` centralizes every backend call. A single `request()`
@@ -238,8 +255,8 @@ one-line install command in `GenerateTokenModal.jsx` (see section 5).
 **These two uses have different correctness requirements** — the
 `localhost` fallback is fine for the dashboard's own calls when viewed
 locally, but is actively wrong for the install command, since that command
-runs on a *different* machine, where `localhost` means "call yourself."
-In practice this means `VITE_API_URL` should always be set explicitly to a
+runs on a *different* machine, where `localhost` means "call yourself." In
+practice this means `VITE_API_URL` should always be set explicitly to a
 real, externally-reachable address (LAN IP in dev/testing, public domain
 in production) as soon as the install command needs to leave the machine
 running the dashboard.
@@ -275,6 +292,55 @@ exist yet).
 A separate `DELETE /admin/agents/{agent_id}` permanently removes the row —
 this action has no "undo," unlike revoke.
 
+### 3.5 Tenant scoping — the Model 1 → Model 2 bridge (new this phase)
+
+**What exists now:** an `organizations` table was added as the root tenant
+entity, seeded with a single static row:
+
+```sql
+org_id: 00000000-0000-0000-0000-000000000001
+name:   "Default SME"
+```
+
+`tenant_id` foreign keys were added to `agents` and `enrollment_tokens`
+(both `NOT NULL`, referencing `organizations.org_id`). Every insert into
+either table — `POST /agent/register` and `POST /admin/generate-token` —
+now sets `tenant_id` to a hardcoded constant,
+`core/constants.py::DEFAULT_TENANT_ID`, matching the seeded default org.
+
+**What this is, precisely: bookkeeping, not isolation.** Every row in the
+system currently belongs to the same one tenant, by construction. No query
+anywhere filters by `tenant_id` yet — `GET /agents`, for example, still
+does an unconditional `select(Agent)` and returns every row regardless of
+tenant. That's correct and harmless under Model 1, where exactly one
+tenant exists, but it is **not** safe to reuse as-is under Model 2, where
+it would return every organization's agents to every logged-in admin
+without any filtering.
+
+**What still has to be built before Model 2 is real, not just schema-ready:**
+
+1. **`users` needs its own `tenant_id` column.** It doesn't have one yet —
+   nothing currently ties an admin login to a specific organization.
+2. **The JWT needs a `tenant_id` claim**, sourced from that new
+   `users.tenant_id` column at login time (`POST /auth/login` in
+   `routers/auth.py`), alongside the existing `sub` (user id) claim.
+3. **Every admin-facing query needs a `.where(Model.tenant_id ==
+   current_tenant_id)` clause**, sourced from the decoded JWT via
+   `core/deps.py`. This applies to `GET /agents` today, and to any future
+   admin-facing route.
+4. **Agent-facing routes stay keyed off the agent's own row**, not a JWT —
+   `POST /agent/heartbeat` and the future `POST /agent/events` should pull
+   `tenant_id` from the already-authenticated `Agent` row rather than
+   trusting a client-supplied value, so a compromised agent can't claim to
+   belong to a different tenant.
+5. **`DEFAULT_TENANT_ID` goes away** (or becomes purely a seed-data
+   convenience, not something routers reference at request time) once (1)–(3)
+   are in place.
+
+None of this is required for Model 1 to keep working correctly — it's
+listed here so the gap between "tenant-shaped schema" and "actual tenant
+isolation" is explicit and doesn't get assumed-away later.
+
 ---
 
 ## 4. Folder Responsibilities
@@ -283,19 +349,20 @@ this action has no "undo," unlike revoke.
 |---|---|
 | `server/app/config.py` | Loads `.env`, exposes `settings.DATABASE_URL`, `settings.JWT_SECRET_KEY`. No logic. |
 | `server/app/db/database.py` | Async engine, session factory, shared `Base`, `get_db()` dependency. No business logic. |
-| `server/app/db/models.py` | SQLAlchemy classes mirroring Postgres tables. Structure only — no validation, no request handling. |
+| `server/app/db/models.py` | SQLAlchemy classes mirroring Postgres tables. Structure only — no validation, no request handling. Now includes `Organization` alongside `EnrollmentToken`, `Agent`, `User`. |
 | `server/app/schemas/*.py` | Pydantic request/response shapes. Controls exactly what's accepted from clients and exposed back — including UTC-safe datetime serialization (see `api-contract.md`). |
+| `server/app/core/constants.py` | **New this phase.** Shared constants — currently just `DEFAULT_TENANT_ID`, the single-tenant placeholder used by `agent.py` and `admin.py` at insert time (see 3.5). |
 | `server/app/core/security.py` | Password hashing (bcrypt via passlib) and JWT create/verify (python-jose). Pure functions — no DB access. |
 | `server/app/core/deps.py` | `get_current_user_id` — the FastAPI dependency that guards protected routes. |
 | `server/app/routers/agent.py` | Agent-facing lifecycle: register, heartbeat. Public routes, credential-based auth in the body. |
 | `server/app/routers/admin.py` | Admin-facing agent management: generate-token, revoke, unrevoke, delete. All JWT-protected. |
-| `server/app/routers/downloads.py` | **New this phase.** Public binary distribution: serves the compiled Go agent binaries for the one-line install flow. |
+| `server/app/routers/downloads.py` | Public binary distribution: serves the compiled Go agent binaries for the one-line install flow. |
 | `server/app/routers/auth.py` | Human login and password management. |
 | `server/app/detection/` | (Planned) Turns raw event data into a `score`/`verdict`. |
 | `server/app/response/` | (Planned) Takes a verdict and acts on it (isolate host, alert, etc.). |
-| `server/app/static/binaries/` | **New this phase.** Compiled Go agent binaries served by `downloads.py`. Manually rebuilt/replaced — no automation yet. |
+| `server/app/static/binaries/` | Compiled Go agent binaries served by `downloads.py`. Manually rebuilt/replaced — no automation yet. |
 | `server/app/main.py` | Creates the FastAPI app, registers routers, CORS middleware. No business logic. |
-| `agent/` (Go, module `khemstrix-agent`) | Compiles to a single binary; registers, heartbeats, collects IP/MAC. Fully built this phase (was empty scaffolding before). Runs in the foreground only — no background service support yet (see `report.md`). |
+| `agent/` (Go, module `khemstrix-agent`) | Compiles to a single binary; registers, heartbeats, collects IP/MAC. Runs in the foreground only — no background service support yet (see `report.md`). |
 | `dashboard/` (React + Vite) | Admin-facing UI: login, agent list (with IP/MAC/actions), enrollment token generation with real install command. See `api-contract.md` for exactly which endpoints it currently calls. |
 | `docs/` | This documentation set. |
 
@@ -303,9 +370,9 @@ this action has no "undo," unlike revoke.
 
 ## 5. Binary Distribution — the One-Line Install Flow
 
-New this phase: a Wazuh-style single chained command that downloads and
-immediately runs the agent, replacing the earlier two-step "download the
-`.exe` manually, then run a separate command" placeholder.
+A Wazuh-style single chained command that downloads and immediately runs
+the agent, replacing the earlier two-step "download the `.exe` manually,
+then run a separate command" placeholder.
 
 ```
 1. Admin opens "Generate Enrollment Token" in the dashboard
@@ -345,7 +412,7 @@ Fixed by resolving relative to the router file's own location via
 code in this project — never assume a particular working directory.
 
 **AV/heuristic flagging is expected, not a bug.** The compiled Windows
-binary was flagged by 2 of 60 VirusTontal engines, both generic
+binary was flagged by 2 of 60 VirusTotal engines, both generic
 ML-heuristic detections rather than signature matches. This is normal for
 any new, unsigned, zero-reputation executable that behaves like a
 monitoring agent (persistent background process, outbound network calls,
@@ -357,26 +424,36 @@ any production distribution.
 
 ## 6. Data Model Snapshot
 
-**Tables in Postgres:** `enrollment_tokens`, `agents`, `users`.
-`events` is defined in `db/models.py` but currently **commented out**
-(along with the matching `Agent.events` relationship) — not yet created in
-Postgres. See `developer.md` for the exact steps to bring it online when
-Phase 1.1 (event pipeline) begins.
+**Tables in Postgres:** `organizations`, `enrollment_tokens`, `agents`,
+`users`. `events` is defined in `db/models.py` but currently **commented
+out** (along with the matching `Agent.events` relationship) — not yet
+created in Postgres. See `developer.md` for the exact steps to bring it
+online when Phase 1.1's event pipeline work resumes.
 
 ```
-enrollment_tokens          agents                       users
-─────────────────          ──────                       ─────
-token (PK)          ◀────  enrollment_token (FK)         user_id (PK)
-created_at                 agent_id (PK)                 username (unique)
-expires_at                 hostname                      password_hash
-used                       os                             created_at
-                           api_key (unique)
-                           status ("active"/"revoked")
-                           created_at
-                           last_seen_at
-                           ip_address    ← added this phase
-                           mac_address   ← added this phase
+organizations               enrollment_tokens          agents                       users
+─────────────               ─────────────────          ──────                       ─────
+org_id (PK)          ◀────  token (PK)          ◀────  enrollment_token (FK)         user_id (PK)
+name                        created_at                 agent_id (PK)                 username (unique)
+created_at                  expires_at                 hostname                      password_hash
+                             used                        os                             created_at
+                             tenant_id (FK)  ← new       api_key (unique)
+                                                          status ("active"/"revoked")
+                                                          created_at
+                                                          last_seen_at
+                                                          ip_address
+                                                          mac_address
+                                                          tenant_id (FK)  ← new
 ```
+
+**`organizations` is new this phase** — the root tenant entity described
+in section 3.5. Seeded with exactly one row (`"Default SME"`,
+`00000000-0000-0000-0000-000000000001`) for Model 1. `agents` and
+`enrollment_tokens` both gained a `NOT NULL` `tenant_id` foreign key
+pointing at it; every current insert path sets this to the seeded default
+via `core/constants.py::DEFAULT_TENANT_ID`. `users` does **not** yet have
+a `tenant_id` column — see 3.5 for why that's the next gap to close before
+Model 2 is meaningfully multi-tenant, not just multi-tenant-shaped.
 
 **Why `enrollment_token` isn't the primary key of `agents`:** it's a
 foreign key used purely for audit trail (which token authorized this
