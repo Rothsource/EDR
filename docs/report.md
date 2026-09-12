@@ -124,6 +124,16 @@ To prevent incoming telemetry spikes from starving database connections, decoupl
 - Includes random time jitter (±3 seconds) to prevent simultaneous connections from crowding local office network routers.
 - **Offline Durability**: Retains buffered logs in memory during temporary network drops and retries on subsequent flush cycles.
 
+### 5. Real-Time Fast-Path for Critical Events (Planned)
+
+The 20-second batch window in Item 4 is correct for routine telemetry but too slow for a detection that needs an immediate response (e.g. ransomware-pattern file activity, a brute-force authentication burst). Rather than shortening the batch window for everyone — which reintroduces the request-overhead problem Item 4 exists to solve — a second, low-volume path is added alongside it:
+
+- A persistent WebSocket connection (`/agent/stream`) is opened by the agent at startup and held open, reusing the same FastAPI app and agent-credential authentication as the existing REST endpoints.
+- Routing is mechanical, not a threat judgment made on the agent: events belonging to a small set of high-signal classes (Process Activity, failed Authentication) or crossing a `severity_id` threshold skip the 50-item/20s buffer and are sent immediately over the socket. Everything else stays on the existing batch path.
+- When a fast-path event fires, the agent drains whatever is currently sitting in the routine buffer and sends it in the same frame, giving the server forensic context (the preceding seconds of file/network activity) alongside the alert at no extra cost.
+- The agent still performs zero classification — it is only ever asking "which lane does this event type belong to," never "is this malicious." That judgment stays entirely server-side, consistent with Section 5's detection pipeline.
+- Both paths write into the same `events` table using the same idempotent insert (`event_id` conflict key) — this is additive to the existing pipeline, not a replacement, and the REST batch endpoint stays in place as a fallback for agents on networks that cannot sustain a persistent connection.
+
 ## 4. The Standard Event Contract
 
 Every future telemetry module (email phishing today; process execution, network sockets, and file integrity monitoring in Phase 2) must adhere to this standard event envelope:
@@ -264,7 +274,15 @@ To comply with Cambodia's draft data protection standards, the system operates o
 - Train the baseline NLP phishing model on benchmark corpora and export `model.joblib`.
 - Build `server/app/detection/email_scorer.py` and hook it into the background queue worker.
 
-### Step 6: End-to-End System Verification
+### Step 6: Fast-Path Critical Event Delivery (WebSocket)
+- Add `/agent/stream` WebSocket route to the FastAPI app, authenticated the same way as `/agent/events`; keep the REST batch endpoint live in parallel.
+- Define the initial fast-lane rule set: Process Activity events, failed/anomalous Authentication events, and any event where `severity_id` crosses an agreed threshold.
+- Implement the agent-side router (`agent/internal/core/router.go` or similar) that sends fast-lane events immediately and drains the current routine buffer alongside them, versus depositing everything else into the existing `EventBuffer`.
+- Enforce hard caps on the new send path (in-memory send buffer size, disk spool size for extended outages) with a defined drop policy when full — no unbounded growth on the endpoint if the server is unreachable.
+- Wire fast-lane detections into the `alerts` table (Detection Finding, class_uid 2004) and fire a notification (webhook or dashboard push) at match time, not on a polling cycle — the database write alone is not fast enough to count as alerting.
+
+### Step 7: End-to-End System Verification
 - Dispatch synthetic event batches via `curl` to `POST /agent/events`; verify `202 Accepted`.
 - Query PostgreSQL directly (`SELECT * FROM events;`) to confirm unbuffered writes.
 - Verify detection scoring outputs and confirm raw email bodies are not written to disk.
+- Simulate a fast-lane event (e.g. a synthetic mass file-rename or a failed-login burst) and confirm it reaches the server and appears in `alerts` in well under the 20-second batch window, alongside the routine events sent in the same frame.
