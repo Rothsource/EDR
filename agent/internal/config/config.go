@@ -58,6 +58,14 @@ func statePath() string {
 	return "/etc/khemstrix-agent/state.json"
 }
 
+// Dir returns the directory that holds config.json and state.json, so other
+// packages (e.g. the SQLite durable outbox) can put their own files
+// alongside them without duplicating the OS-specific path logic that lives
+// in configPath/statePath.
+func Dir() string {
+	return filepath.Dir(configPath())
+}
+
 // Load returns an error if no config exists yet — that error IS the signal
 // main.go uses to decide "this is a fresh install, go register."
 func Load() (*Config, error) {

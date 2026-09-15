@@ -292,7 +292,7 @@ exist yet).
 A separate `DELETE /admin/agents/{agent_id}` permanently removes the row —
 this action has no "undo," unlike revoke.
 
-### 3.5 Tenant scoping — the Model 1 → Model 2 bridge (new this phase)
+### 3.5 Tenant scoping — the Model 1 → Model 2 bridge
 
 **What exists now:** an `organizations` table was added as the root tenant
 entity, seeded with a single static row:
@@ -317,6 +317,10 @@ tenant exists, but it is **not** safe to reuse as-is under Model 2, where
 it would return every organization's agents to every logged-in admin
 without any filtering.
 
+**`events` now follows the same rule.** Its `tenant_id` column is
+`NOT NULL`, referencing `organizations.org_id`, same as `agents` and
+`enrollment_tokens` — see section 7 for how it gets set.
+
 **What still has to be built before Model 2 is real, not just schema-ready:**
 
 1. **`users` needs its own `tenant_id` column.** It doesn't have one yet —
@@ -327,9 +331,9 @@ without any filtering.
 3. **Every admin-facing query needs a `.where(Model.tenant_id ==
    current_tenant_id)` clause**, sourced from the decoded JWT via
    `core/deps.py`. This applies to `GET /agents` today, and to any future
-   admin-facing route.
+   admin-facing route (including whatever eventually reads `events`).
 4. **Agent-facing routes stay keyed off the agent's own row**, not a JWT —
-   `POST /agent/heartbeat` and the future `POST /agent/events` should pull
+   `POST /agent/heartbeat` and `POST /agent/events` should pull
    `tenant_id` from the already-authenticated `Agent` row rather than
    trusting a client-supplied value, so a compromised agent can't claim to
    belong to a different tenant.
@@ -349,20 +353,21 @@ isolation" is explicit and doesn't get assumed-away later.
 |---|---|
 | `server/app/config.py` | Loads `.env`, exposes `settings.DATABASE_URL`, `settings.JWT_SECRET_KEY`. No logic. |
 | `server/app/db/database.py` | Async engine, session factory, shared `Base`, `get_db()` dependency. No business logic. |
-| `server/app/db/models.py` | SQLAlchemy classes mirroring Postgres tables. Structure only — no validation, no request handling. Now includes `Organization` alongside `EnrollmentToken`, `Agent`, `User`. |
+| `server/app/db/models.py` | SQLAlchemy classes mirroring Postgres tables. Structure only — no validation, no request handling. Now includes `Organization`, `Event`, and `Alert` alongside `EnrollmentToken`, `Agent`, `User`. |
 | `server/app/schemas/*.py` | Pydantic request/response shapes. Controls exactly what's accepted from clients and exposed back — including UTC-safe datetime serialization (see `api-contract.md`). |
-| `server/app/core/constants.py` | **New this phase.** Shared constants — currently just `DEFAULT_TENANT_ID`, the single-tenant placeholder used by `agent.py` and `admin.py` at insert time (see 3.5). |
+| `server/app/core/constants.py` | Shared constants — currently just `DEFAULT_TENANT_ID`, the single-tenant placeholder used by `agent.py` and `admin.py` at insert time (see 3.5). |
 | `server/app/core/security.py` | Password hashing (bcrypt via passlib) and JWT create/verify (python-jose). Pure functions — no DB access. |
 | `server/app/core/deps.py` | `get_current_user_id` — the FastAPI dependency that guards protected routes. |
-| `server/app/routers/agent.py` | Agent-facing lifecycle: register, heartbeat. Public routes, credential-based auth in the body. |
+| `server/app/core/event_queue.py` | **Planned, not yet built.** In-process `asyncio.Queue` + background consumer absorbing event batches from `routers/agent.py` — see section 7. |
+| `server/app/routers/agent.py` | Agent-facing lifecycle: register, heartbeat. `POST /agent/events` planned, not yet built (section 7). Public routes, credential-based auth in the body. |
 | `server/app/routers/admin.py` | Admin-facing agent management: generate-token, revoke, unrevoke, delete. All JWT-protected. |
 | `server/app/routers/downloads.py` | Public binary distribution: serves the compiled Go agent binaries for the one-line install flow. |
 | `server/app/routers/auth.py` | Human login and password management. |
 | `server/app/detection/` | (Planned) Turns raw event data into a `score`/`verdict`. |
 | `server/app/response/` | (Planned) Takes a verdict and acts on it (isolate host, alert, etc.). |
 | `server/app/static/binaries/` | Compiled Go agent binaries served by `downloads.py`. Manually rebuilt/replaced — no automation yet. |
-| `server/app/main.py` | Creates the FastAPI app, registers routers, CORS middleware. No business logic. |
-| `agent/` (Go, module `khemstrix-agent`) | Compiles to a single binary; registers, heartbeats, collects IP/MAC. Runs in the foreground only — no background service support yet (see `report.md`). |
+| `server/app/main.py` | Creates the FastAPI app, registers routers, CORS middleware. Will also need to start/stop the event queue consumer once section 7 is built. |
+| `agent/` (Go, module `khemstrix-agent`) | Compiles to a single binary; registers, heartbeats, collects IP/MAC. Runs in the foreground only — no background service support yet (see `report.md`). Event batching (ring buffer, 50 events / 20s flush) is planned but not yet implemented in the Go agent. |
 | `dashboard/` (React + Vite) | Admin-facing UI: login, agent list (with IP/MAC/actions), enrollment token generation with real install command. See `api-contract.md` for exactly which endpoints it currently calls. |
 | `docs/` | This documentation set. |
 
@@ -425,10 +430,11 @@ any production distribution.
 ## 6. Data Model Snapshot
 
 **Tables in Postgres:** `organizations`, `enrollment_tokens`, `agents`,
-`users`. `events` is defined in `db/models.py` but currently **commented
-out** (along with the matching `Agent.events` relationship) — not yet
-created in Postgres. See `developer.md` for the exact steps to bring it
-online when Phase 1.1's event pipeline work resumes.
+`users`, `events`, `alerts`. `events` and `alerts` were brought online this
+phase — no longer commented out in `db/models.py`, and now exist in
+Postgres as real tables (see `phase2-event-schema.md` for the full
+OCSF field spec). Nothing currently writes to them yet — that's the
+ingestion pipeline described in section 7.
 
 ```
 organizations               enrollment_tokens          agents                       users
@@ -436,14 +442,44 @@ organizations               enrollment_tokens          agents                   
 org_id (PK)          ◀────  token (PK)          ◀────  enrollment_token (FK)         user_id (PK)
 name                        created_at                 agent_id (PK)                 username (unique)
 created_at                  expires_at                 hostname                      password_hash
-                             used                        os                             created_at
-                             tenant_id (FK)  ← new       api_key (unique)
-                                                          status ("active"/"revoked")
-                                                          created_at
-                                                          last_seen_at
-                                                          ip_address
-                                                          mac_address
-                                                          tenant_id (FK)  ← new
+   ▲                         used                        os                             created_at
+   │                         tenant_id (FK)              api_key (unique)
+   │                                                      status ("active"/"revoked")
+   │                                                      created_at
+   │                                                      last_seen_at
+   │                                                      ip_address
+   │                                                      mac_address
+   │                                                      tenant_id (FK)
+   │                                                          ▲
+   │                                                          │
+   └──────────────────────────────┐                           │
+                                    │                           │
+                              events                            │
+                              ──────                            │
+                              event_id (PK)                     │
+                              time                               │
+                              class_uid / category_uid /         │
+                                activity_id / type_uid            │
+                              severity_id                          │
+                              hostname / username                   │
+                              agent_id (FK)  ─────────────────────┘
+                              tenant_id (FK)  ─────────────────────┘
+                              metadata (jsonb)
+                              data (jsonb)
+                              created_at
+                                   ▲
+                                   │
+                              alerts
+                              ──────
+                              alert_id (PK)
+                              event_id (FK)
+                              class_uid (default 2004)
+                              technique_id
+                              d3fend_action
+                              risk_score
+                              source ("rule" / "ml_anomaly")
+                              requires_review
+                              created_at
 ```
 
 **`organizations` is new this phase** — the root tenant entity described
@@ -466,3 +502,98 @@ following the "Modifying an Existing Table" checklist in `developer.md`
 `routers/agent.py`. Both are optional by design: existing rows predating
 the change have no way to retroactively gain a value, and detection can
 legitimately fail on some network configurations.
+
+**`events.metadata` and `events.data` are JSONB, not a column per
+field.** OCSF's class-specific fields (`process{}`, `file{}`, `network{}`,
+etc.) vary by `class_uid`, so instead of one column per possible field
+across every class, only the Base Event fields that are shared across
+*all* classes (`time`, `class_uid`, `severity_id`, `hostname`, ...) are
+real indexed columns. Everything class-specific lives in `data`, queried
+via the GIN index when needed. Adding a new OCSF class later (e.g. Email
+Activity) needs no migration — just a new `class_uid` value and a new
+shape inside `data`.
+
+**`events.tenant_id` is denormalized, not derived via a join.** It's
+copied from `agents.tenant_id` at insert time rather than requiring every
+query to join through `agents` to filter by tenant. Same rule as section
+3.5 point 4: this value must come from the authenticated `Agent` row
+server-side, never from the client payload directly.
+
+---
+
+## 7. Event Ingestion Pipeline — Design, Not Yet Built
+
+**Status: planned.** Nothing in this section exists in code yet — no
+`POST /agent/events` route, no `core/event_queue.py`, no agent-side ring
+buffer. This section documents the agreed design so implementation can
+follow it directly when it's picked up, rather than re-deriving it from
+scratch. It follows the same "Postgres first, then the rest" discipline as
+every other schema change in this project — here, Postgres (`events`,
+`alerts`) is already done; the code that writes to it is the remaining
+work.
+
+### 7.1 Why batching, not one request per event
+
+A single monitored endpoint can generate many events per second (file
+writes, process spawns, socket opens). One HTTP request per event would
+mean hundreds of requests/second even for a small office of monitored
+machines — real cost on hardware that Model 1 deliberately keeps cheap
+(an existing office workstation or mini-PC, not a dedicated server, per
+`README.md` section 3). Every request pays roughly the same fixed
+overhead — TCP/TLS handshake, credential lookup, DB session — regardless
+of whether it carries one event or fifty, so batching amortizes that cost.
+It's also more resilient on the flakier office internet this project
+targets: one flush every ~20s is a much smaller unit to retry than
+hundreds of individual requests.
+
+**Agent side (planned):** a ring buffer holds up to 50 events, flushed
+either when full or after 20 seconds (with jitter, to avoid every agent
+in an office flushing in the same instant) — whichever comes first. One
+flush = one `POST /agent/events` call carrying a JSON array of events.
+
+### 7.2 Why an in-process queue, not a synchronous insert
+
+Model 1 deliberately avoids external brokers (Redis, etc.) — see
+`README.md` section 3, "event ingestion uses an in-process asynchronous
+queue rather than external brokers ... to run reliably on low-spec
+hardware." The planned design:
+
+```
+POST /agent/events
+      │
+      ▼
+verify agent_id + api_key (same pattern as heartbeat)
+      │
+      ▼
+stamp agent_id + tenant_id from the authenticated Agent row
+      │  (never trust these from the client payload — 3.5 point 4)
+      ▼
+push the batch onto an in-process asyncio.Queue
+      │
+      ▼
+return 202 immediately — the HTTP response does not wait on the DB write
+      │
+      ▼ (separate background task, started at FastAPI startup)
+background consumer drains the queue, one batch at a time
+      │
+      ▼
+bulk insert into `events` (ON CONFLICT DO NOTHING on event_id,
+  so a client retry after a dropped response doesn't double-insert)
+```
+
+This decouples "how fast agents can flush" from "how fast Postgres can
+absorb writes" — without it, N agents flushing at once means N concurrent
+DB transactions competing for the same connection pool on a single
+low-spec machine.
+
+### 7.3 Open questions before this gets built
+
+- Exact request/response shape for `POST /agent/events` (schema in
+  `schemas/agent.py`, alongside `AgentHeartbeat`).
+- Queue backpressure behavior if the consumer falls behind: block the
+  producer (slow the agent down) vs. reject with a retryable error.
+  Current lean is block, since losing events silently is worse than a
+  slow flush.
+- Whether `type_uid` is recomputed server-side (`class_uid * 100 +
+  activity_id`) rather than trusted from the agent payload, matching the
+  "Calculated" rule in `phase2-event-schema.md` section 1.

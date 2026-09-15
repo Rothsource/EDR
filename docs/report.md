@@ -79,54 +79,80 @@ Every item below is implemented, compiled, and verified across separate physical
 
 ## 3. Scalable Architecture Foundations (Phase 1.1)
 
-To transition from machine inventory (heartbeats) to security threat monitoring (events) without future code rewrites, four architectural seams must be established:
-
-```
-                                  INGESTION & BUFFERING PIPELINE
-
- [ Go Endpoint Agent ]                    [ FastAPI Backend ]                 [ PostgreSQL ]
-┌─────────────────────┐                 ┌────────────────────┐             ┌────────────────────┐
-│ In-Memory Buffer    │  Batch Flush    │  asyncio.Queue      │  Bulk       │  organizations     │
-│ • Max 50 items      ├────────────────►│  • Buffer bursts    ├────────────►│  agents            │
-│ • 20s Jitter Ticker │  HTTP 202 (<5ms)│  • Background task  │  Insert     │  events (Partition │
-└─────────────────────┘                 └────────────────────┘             │   by Month)        │
-                                                                            └────────────────────┘
-```
-
-### 1. Database Multi-Tenancy Anchor
+### 3.1 Database Multi-Tenancy Anchor
 
 - Create an `organizations` table as the root tenant entity.
 - Seed a static default UUID (`00000000-0000-0000-0000-000000000001`, "Default SME").
 - Add `tenant_id` foreign keys to `agents`, `enrollment_tokens`, and `events`.
 - **Why**: Model 1 runs cleanly as a single-tenant instance. Model 2 simply registers additional organization rows, and queries filter via `WHERE tenant_id = :current_tenant` without requiring schema migrations.
 
-### 2. Time-Based Partitioning on Telemetry
+### 3.2 Time-Based Partitioning on Telemetry
 
 - High-volume security logs rapidly degrade standard B-Tree indexing.
 - Partition the `events` table by `RANGE (timestamp)` in monthly increments (`events_2026_09`).
 - Telemetry past the Cambodian regulatory 90-day retention window can be dropped instantly via `DROP TABLE events_YYYY_MM`, avoiding database vacuum locks.
 
-### 3. Asynchronous In-Process Queue (asyncio.Queue)
+### 3.3 Ingestion Transport — Superseded Design Note
 
-To prevent incoming telemetry spikes from starving database connections, decouple API receipt from database writes.
+The original plan for this section was edge-side batching (agent buffers up to 50 events or 20 seconds, then flushes over REST into an `asyncio.Queue`). **That plan has since been replaced.** The batching approach is fine for routine telemetry, but too slow for urgent detections — ransomware or brute-force login activity needs the server to know immediately, not up to 20 seconds later. Sections 3.4–3.7 below describe the design that replaced it, and its real, current implementation status.
 
-- Avoid external broker installations (Redis, RabbitMQ, Celery) to keep Model 1 lightweight on low-spec SME hardware.
-- Use Python's native `asyncio.Queue(maxsize=5000)`:
-  - `POST /agent/events` validates caller authentication and schema.
-  - Enqueues the batch into process memory via `.put_nowait()`.
-  - Returns `202 Accepted` in <5ms.
-- An asynchronous worker task tied to the FastAPI lifespan consumes batches, runs heuristic detection, and executes bulk database commits (`session.add_all()`).
+### 3.4 The Problem: What Happens When a Persistent Connection Dies
 
-### 4. Edge Batching & Jitter on the Endpoint
+Moving to a persistent WebSocket solves the latency problem — events stream immediately, with zero agent-side classification logic. But it introduces a new one: a WebSocket doesn't degrade gracefully the way batched HTTP does. It just dies — from wifi loss, laptop sleep, a proxy, or the server itself going down — and anything in flight at that moment is lost unless handled explicitly. Designing for that failure mode was the core of this phase's work.
 
-- The Go agent buffers security observations in a thread-safe slice rather than making an HTTP call per event.
-- Flushes occur when the buffer reaches 50 events or when a 20-second ticker fires.
-- Includes random time jitter (±3 seconds) to prevent simultaneous connections from crowding local office network routers.
-- **Offline Durability**: Retains buffered logs in memory during temporary network drops and retries on subsequent flush cycles.
+### 3.5 The Agreed Design
+
+- **Durable local outbox (SQLite):** every event is written to disk on the endpoint the moment it's generated, before any send is attempted. It is never deleted on send — only once the server confirms receipt. Status flow: pending → sent-but-unacknowledged → acknowledged (row removed).
+- **On disconnect:** nothing special has to happen — the event was already safe on disk the instant it was written.
+- **On reconnect:** the agent sends the server its list of currently-unacknowledged event IDs; the server replies with which of those it already has; the agent resends only what's genuinely missing. One round trip, not one request per event.
+- **Idempotent insert is the real safety net:** the server's insert is keyed on the event ID with "do nothing on conflict," so even a duplicate resend is a harmless no-op. Correctness never depends on the reconcile step working perfectly.
+- **Heartbeat is server-initiated:** the server pings roughly every 10 seconds; the agent just replies and resets a timer. If the agent misses 2-3 pings in a row (roughly 20-30 seconds), it assumes the connection is dead, stops trying to push, and lets events accumulate safely in the outbox.
+- **Reconnection is agent-initiated**, independent of the heartbeat, using exponential backoff with random jitter — this avoids every agent in the fleet retrying in the same instant if the server itself is what went down.
+- **REST keeps a narrow, secondary role:** it only helps in the specific case where a proxy blocks the WebSocket upgrade but the network is otherwise fine. A full outage defeats REST too — the durable outbox is what actually protects against that case, not a REST fallback.
+
+### 3.6 Status: Server Side — Done and Tested
+
+| Component | File | Status |
+|---|---|---|
+| Message schemas | `server/app/schemas/ws.py` | Done — auth, event, ack, reconcile request/response, ping/pong, and error message shapes |
+| Connection registry | `server/app/core/ws_manager.py` | Done |
+| WebSocket route | `server/app/routers/ws.py` | Done — handles the auth handshake, idempotent event insert, sending acks, and reconciliation |
+| Heartbeat loop | `server/app/core/ws_heartbeat.py` | Done — pings roughly every 10 seconds, disconnects an unresponsive agent after about 30 |
+
+Verified end-to-end: the auth handshake accepts good credentials and rejects bad or malformed ones; heartbeat ping/pong keeps a connection alive; an idle connection is correctly evicted after missed pongs; an event sent over the socket is inserted and acknowledged, with the row confirmed directly in the database; reconciliation was tested by sending one real event ID and one fake one, and only the real one came back as known; the idempotent insert was confirmed to make duplicate sends harmless.
+
+One real bug was found and fixed during testing: the database's event-time column doesn't store timezone information, but incoming timestamps parse as timezone-aware on the server side, which the database driver rejects. The fix strips the timezone before insert. This is a good example of the kind of subtle mismatch that only surfaces once both sides are actually wired together and tested — worth keeping in mind for the Go agent's own timestamp handling as that work continues.
+
+### 3.7 Status: Go Agent Side — In Progress
+
+**Important correction to an earlier version of this status:** an earlier internal status note claimed the agent-side outbox file and a supporting config helper were "already written," and referenced two agent source files (`core/net.go`, `core/http.go`) that turned out not to exist under those names in the real repository (the actual files are `core/netinfo.go` and `core/sender.go`). Before doing any further work, the actual file tree was checked directly, and the claimed-done outbox work did not, in fact, exist yet. It has since been written for real, listed below. The lesson carried forward: status write-ups describe intent until verified against the real repository.
+
+**Actually done and confirmed building successfully:**
+
+- A small helper (`Dir()`) was added to `agent/internal/config/config.go` so other packages can locate the same directory as the agent's existing `config.json` / `state.json` without duplicating the OS-specific path logic.
+- The durable local outbox was written at `agent/internal/store/store.go` — a SQLite-backed store with the write/mark-sent/mark-acknowledged/list-unacknowledged/list-pending operations the design in 3.5 calls for. The new SQLite dependency was fetched and the agent module was confirmed to build cleanly with it in place.
+- The WebSocket client was written at `agent/internal/wsclient/wsclient.go` — handling the connect-and-authenticate handshake, replying to server pings and detecting a dead connection when they stop arriving, the reconcile-on-reconnect exchange described in 3.5, and the reconnect loop with exponential backoff and jitter. Its message formats were matched directly against the real `server/app/schemas/ws.py` field names rather than assumed. **This file has not yet been build-tested** — it depends on a UUID library that has not yet been fetched into the agent module (see 3.8, step 1).
+
+**Not yet done:**
+
+- The WebSocket client has not yet been wired into the agent's main run loop (`agent/internal/core/run.go`), so it isn't actually running as part of the agent yet.
+- No detection module currently generates events to send — the email, process, network, file, and response modules under `agent/internal/modules/` don't yet call into the new WebSocket client. A temporary way to generate a test event will be needed before real integration testing can happen.
+- No integration testing has been performed yet — this is the most important gap. Nothing described here has been proven to work end-to-end against a live server.
+
+### 3.8 What's Left — Step by Step
+
+1. **Fetch the remaining Go dependency and confirm the WebSocket client actually builds.** This is the first real build test of the new client code and the immediate next action.
+2. **Wire the WebSocket client into the agent's run loop**, so it starts alongside the existing heartbeat cycle, sharing the same agent credentials and shutdown handling.
+3. **Add a temporary way to generate a test event**, since no detection module produces one yet, so the integration test in step 4 has something real to send.
+4. **Run a full integration test against a live server:** disconnect the agent mid-stream (wifi off, or the server itself stopped), confirm the event lands safely in the local outbox file, bring the connection back, and confirm the server ends up with exactly one copy of the event — no loss, no duplication.
+5. **Run a reconnect-storm test:** start several agent instances at once, stop the server, bring it back, and confirm from the logs that their reconnect attempts are spread out rather than all landing in the same instant.
+6. **Known follow-ups, not blocking but worth tracking:** the local outbox needs a bounded-size policy so a very long outage can't fill the endpoint's disk unnoticed; the reconcile exchange should be chunked if a backlog gets very large; and the fact that a disconnected agent pauses detection entirely (rather than falling back to anything) is an accepted tradeoff that should be written down somewhere visible, such as an operations runbook.
 
 ## 4. The Standard Event Contract
 
-Every future telemetry module (email phishing today; process execution, network sockets, and file integrity monitoring in Phase 2) must adhere to this standard event envelope:
+**Note:** the field names below reflect the original design intent for this contract, but the event schema actually implemented and tested in `server/app/schemas/ws.py` uses different field names (classification-code style fields such as class/category/activity/type/severity identifiers, plus a generic data payload) rather than the `event_type` / `raw_data` / `extracted_features` shape shown here. The two should be reconciled — either update this section to match the real schema, or confirm the real schema needs to change to match this one — before more telemetry modules are built against either version.
+
+Every future telemetry module (email phishing today; process execution, network sockets, and file integrity monitoring in Phase 2) was originally intended to adhere to this standard event envelope:
 
 ```json
 {
@@ -224,12 +250,12 @@ To comply with Cambodia's draft data protection standards, the system operates o
 
 ### Systems Lead Responsibilities (Core Infrastructure)
 
-- **Service Precedence Resolution**: Remove hardcoded `--server=` arguments from `/etc/systemd/system/khemstrix-agent.service`. Ensure `cmd/agent/main.go` gives precedence to `config.json` over CLI flag defaults.
-- **Windows Service Verification**: Audit Windows service execution parameters to ensure runtime settings are not overridden.
-- **Agent Ring Buffer** (`agent/internal/core/event.go`): Implement thread-safe buffer slice with dual-condition flushing (50 events or 20s ticker with jitter).
-- **IMAP Telemetry Module** (`agent/internal/modules/email/`): Connect via IMAP, extract headers, extract links, compute attachment SHA-256 hashes in memory, and purge raw bytes.
-- **Agent Batch Sender** (`agent/internal/core/sender.go`): Implement `SendEvents()` to dispatch JSON batches to `POST /agent/events` with offline retry handling.
-- **Binary Pipeline**: Cross-compile updated binaries and maintain files in `server/app/static/binaries/`.
+- **Service Precedence Resolution**: Remove hardcoded `--server=` arguments from `/etc/systemd/system/khemstrix-agent.service`. Ensure `cmd/agent/main.go` gives precedence to `config.json` over CLI flag defaults. *(Not started.)*
+- **Windows Service Verification**: Audit Windows service execution parameters to ensure runtime settings are not overridden. *(Not started.)*
+- **Durable Outbox** (`agent/internal/store/store.go`): SQLite-backed local store so no event is lost when the connection drops. *(Done, confirmed building.)* Supersedes the earlier ring-buffer plan — the outbox replaces in-memory buffering with something that survives a crash or restart, not just a network blip.
+- **WebSocket Client** (`agent/internal/wsclient/wsclient.go`): Persistent connection, authentication, heartbeat handling, reconnect with backoff and jitter, and reconciliation against the outbox on every reconnect. *(Written, not yet build-tested or wired in — see section 3.8.)* Supersedes the earlier `SendEvents()` batch-dispatcher plan — events stream immediately instead of waiting on a batch window.
+- **IMAP Telemetry Module** (`agent/internal/modules/email/`): Connect via IMAP, extract headers, extract links, compute attachment SHA-256 hashes in memory, and purge raw bytes. *(Not started — this is also the first real source of events the WebSocket client will have once it exists.)*
+- **Binary Pipeline**: Cross-compile updated binaries and maintain files in `server/app/static/binaries/`. *(Not started for this phase.)*
 
 ### AI Teammate Responsibilities (Machine Learning & Ingestion)
 
@@ -238,33 +264,37 @@ To comply with Cambodia's draft data protection standards, the system operates o
 - **Export Trained Pipeline**: Serialize the model and vectorizer to `.joblib` artifacts for integration into FastAPI.
 - **FastAPI Scoring Pipeline** (`server/app/detection/email_scorer.py`): Load artifacts into memory on startup; accept incoming event text and features; return threat probabilities, risk tiers (safe, suspicious, malicious), and threat indicators.
 - **VirusTotal Hash Cache Client**: Build `server/app/detection/virustotal.py` to query SHA-256 hashes against a local cache table before consuming public API quotas.
-- **Database Migration & Schemas**: Execute SQL migration for `organizations` and partitioned `events`; implement `schemas/event.py` with the UTC serializer; build the `asyncio.Queue` worker in `server/app/core/queue.py`.
+- **Database Migration & Schemas**: Execute SQL migration for `organizations` and partitioned `events`; implement `schemas/event.py` with the UTC serializer. *(Not started.)* The `asyncio.Queue` worker item is superseded — events now arrive over the persistent WebSocket route (`server/app/routers/ws.py`) rather than a queued REST endpoint, so no separate queue worker is needed for this path.
 
 ## 7. Next Implementation Steps (Priority Order)
 
-### Step 1: Configuration & Service Precedence Fix
-- Remove `--server=` flag from Linux systemd unit file; reload daemon.
-- Ensure `cmd/agent/main.go` gives priority to `config.json`.
+This replaces the previous step list, which was written against the retired REST-batching design (`asyncio.Queue`, `POST /agent/events`, agent-side ring buffer). The transport decision has since moved to the persistent WebSocket design in section 3, so the steps below reflect that instead.
 
-### Step 2: Database Multi-Tenancy & Partitioning
-- Run the SQL migration to create `organizations` and add `tenant_id` to existing tables.
-- Create the monthly partitioned events table (`events_2026_09`) with indexes on `(tenant_id, created_at DESC)` and `(agent_id, timestamp DESC)`.
-- Update SQLAlchemy models in `server/app/db/models.py`.
+### Step 1: Finish and Prove Out the WebSocket Agent Path
+- Fetch the one remaining Go dependency the WebSocket client needs and confirm the agent module still builds cleanly.
+- Wire the WebSocket client into the agent's main run loop (`agent/internal/core/run.go`) so it runs alongside the existing heartbeat cycle.
+- Add a temporary way to generate a test event, since no real detection module exists yet.
+- Run the full disconnect/reconnect integration test described in section 3.8, confirming no event is lost and none is duplicated.
+- Run the reconnect-storm test with several agent instances to confirm jitter is actually spreading out reconnect attempts.
 
-### Step 3: FastAPI Async Ingestion Pipeline
-- Create `schemas/event.py` with UTC serializer methods.
-- Implement in-process queue and lifespan worker in `core/queue.py` and `main.py`.
-- Create `routers/events.py` with heartbeat-style credential validation returning `202 Accepted`.
+### Step 2: Configuration & Service Precedence Fix
+- Remove the hardcoded `--server=` flag from the Linux systemd unit file and reload the daemon.
+- Ensure `cmd/agent/main.go` gives priority to the values already saved in `config.json` over CLI flag defaults.
 
-### Step 4: Go Agent Batching Core
-- Implement thread-safe `EventBuffer` in `agent/internal/core/event.go`.
-- Add `SendEvents()` to `agent/internal/core/sender.go` with retry resilience.
+### Step 3: Database Multi-Tenancy & Partitioning
+- Run the SQL migration to create the `organizations` table and add `tenant_id` to the existing tables.
+- Create the monthly partitioned events table with indexes appropriate for tenant- and agent-scoped queries.
+- Update the SQLAlchemy models in `server/app/db/models.py` to match.
 
-### Step 5: Offline Model Training & Email Scorer
-- Train the baseline NLP phishing model on benchmark corpora and export `model.joblib`.
-- Build `server/app/detection/email_scorer.py` and hook it into the background queue worker.
+### Step 4: Reconcile the Event Contract
+- Resolve the mismatch flagged in section 4 between the originally-designed event envelope and the event schema actually implemented in `server/app/schemas/ws.py`, so every future telemetry module (email, process, network, file integrity) is built against one agreed shape rather than two conflicting ones.
+
+### Step 5: First Real Telemetry Module — Email Phishing Detection
+- Build the IMAP telemetry module (`agent/internal/modules/email/`) as the agent's first real event source, feeding the now-working WebSocket path from Step 1 instead of sitting idle behind it.
+- Curate and preprocess phishing datasets, train the baseline classifier, and export the trained pipeline as planned in section 6.
+- Build the FastAPI scoring pipeline (`server/app/detection/email_scorer.py`) and the VirusTotal hash-cache client, and hook scoring into the event path that now exists.
 
 ### Step 6: End-to-End System Verification
-- Dispatch synthetic event batches via `curl` to `POST /agent/events`; verify `202 Accepted`.
-- Query PostgreSQL directly (`SELECT * FROM events;`) to confirm unbuffered writes.
-- Verify detection scoring outputs and confirm raw email bodies are not written to disk.
+- Trigger a real phishing-style test event from the IMAP module and confirm it streams over the WebSocket, lands in PostgreSQL, and is correctly scored.
+- Confirm raw email bodies are never written to disk, per the zero-persistence requirement in section 5.
+- Confirm the durable-delivery guarantees from section 3 still hold with a real detection module in the loop, not just a synthetic test event.
