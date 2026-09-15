@@ -5,11 +5,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"runtime"
 	"time"
 
 	"khemstrix-agent/internal/config"
+	"khemstrix-agent/internal/store"
+	"khemstrix-agent/internal/wsclient"
 )
 
 const heartbeatInterval = 30 * time.Second
@@ -52,6 +55,28 @@ func RegisterAndSaveConfig(server, token string) (*config.Config, error) {
 	return cfg, nil
 }
 
+// buildWSURL turns the REST server URL already used for Register/Heartbeat
+// (e.g. "http://192.168.1.10:8000") into the ws(s):// URL for the
+// persistent /agent/ws route on that same host.
+func buildWSURL(server string) (string, error) {
+	u, err := url.Parse(server)
+	if err != nil {
+		return "", fmt.Errorf("parsing server URL %q: %w", server, err)
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+		// already correct, leave as-is
+	default:
+		return "", fmt.Errorf("server URL %q has unrecognized scheme %q", server, u.Scheme)
+	}
+	u.Path = "/agent/ws"
+	return u.String(), nil
+}
+
 func Run(ctx context.Context, flags config.Flags) error {
 	cfg, err := config.Load()
 
@@ -83,6 +108,34 @@ func Run(ctx context.Context, flags config.Flags) error {
 	}
 
 	log.Printf("starting heartbeat loop for agent_id=%s targeting %s", cfg.AgentID, cfg.Server)
+
+	// --- WebSocket streaming path (durable outbox + persistent connection) ---
+	// This runs alongside the existing heartbeat loop below, not instead of
+	// it — heartbeat still owns liveness/IP-MAC refresh over REST; the
+	// WS client owns event delivery. A failure here is logged, not fatal:
+	// the agent should keep doing heartbeats even if streaming can't start.
+	st, err := store.Open()
+	if err != nil {
+		log.Printf("wsclient: could not open durable outbox, event streaming disabled this run: %v", err)
+	} else {
+		wsURL, err := buildWSURL(cfg.Server)
+		if err != nil {
+			log.Printf("wsclient: could not build WebSocket URL, event streaming disabled this run: %v", err)
+			_ = st.Close()
+		} else {
+			wsc, err := wsclient.New(wsURL, cfg.AgentID, cfg.APIKey, st)
+			if err != nil {
+				log.Printf("wsclient: could not construct client, event streaming disabled this run: %v", err)
+				_ = st.Close()
+			} else {
+				log.Printf("wsclient: starting, targeting %s", wsURL)
+				go wsc.Run(ctx)
+				// Note: st is intentionally not closed here — it's owned by
+				// wsc for the remaining lifetime of this run, and needs to
+				// stay open until ctx is cancelled and wsc.Run returns.
+			}
+		}
+	}
 
 	sendHeartbeat := func() {
 		netInfo := GetPrimaryInterface()

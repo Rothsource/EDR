@@ -1,138 +1,770 @@
-# Project Blueprint: KhemStrix EDR
+# 🛡️ KhemStrix EDR
 
-## 1. Executive Summary
+## Affordable, Localized Cybersecurity Detection and Response for Cambodian Organizations
 
-KhemStrix EDR is an open-source-based, AI-enhanced Endpoint Detection & Response (EDR) platform designed specifically for small-to-medium enterprises (SMEs) in Cambodia. While commercial enterprise solutions (e.g., CrowdStrike, SentinelOne) are cost-prohibitive, complex to manage, and extract telemetry outside domestic borders, KhemStrix provides an affordable, sovereign cyber defense alternative.
+---
 
-Inspired by South Korea's AhnLab model—starting with domestic, underserved sectors and growing into a national defense standard—KhemStrix pairs a lightweight, dependency-free Go endpoint agent with a FastAPI/PostgreSQL ingestion engine and localized AI models. It is designed to be easily deployed by non-specialist IT administrators in a private office setting (Model 1) while remaining architecturally ready to scale into a centralized, sovereign threat sensor grid for national authorities such as MPTC and CamCERT (Model 2).
+# 1. Executive Summary
 
-## 2. Problem Statement
+**KhemStrix EDR** is an endpoint security and threat detection platform designed to provide affordable cybersecurity monitoring for small and medium-sized organizations, particularly in Cambodia.
 
-**The Cost and Expertise Barrier:** Enterprise EDR solutions require five-figure annual budgets in foreign currency and dedicated Security Operations Center (SOC) personnel. Cambodian SMEs (accounting firms, clinics, logistics hubs, educational institutions) lack both, leaving them completely unmonitored against ransomware and business email compromise (BEC).
+Many organizations cannot afford enterprise security platforms such as CrowdStrike or SentinelOne, and they may not have dedicated Security Operations Center (SOC) teams or cybersecurity specialists. As a result, important systems and employee devices may operate with limited security visibility.
 
-**Evolving Local Attack Vectors:** Local organizations run high risks on consumer and enterprise communication channels that standard tools rarely correlate simultaneously—namely business email (phishing/spoofing) and Telegram, which serves as the de facto operational and document-sharing backbone across Cambodian businesses and government agencies.
+KhemStrix aims to provide a practical alternative by combining:
 
-**Regulatory and Sovereignty Gaps:** Emerging frameworks (MPTC Draft Cybersecurity Law, Draft Personal Data Protection Law, NBC-TCRMG) mandate auditable security monitoring, log retention, and strict data privacy. Small businesses currently have no accessible platform that satisfies compliance without exposing sensitive communications to overseas commercial clouds.
+* A lightweight endpoint agent
+* Centralized security event collection
+* Endpoint behavior monitoring
+* Rule-based threat detection
+* AI and machine learning analysis
+* MITRE ATT&CK mapping
+* Incident reporting and remediation guidance
 
-## 3. Deployment Models: On-Premise SME vs. Centralized Sovereign Cloud
+The platform will initially focus on monitoring endpoints and detecting suspicious activity such as malicious process execution, suspicious parent-child process relationships, repeated failed login attempts, unusual network connections, and unauthorized file activity.
 
-KhemStrix is engineered from a single codebase to support two deployment realities without requiring architectural rewrites as the project scales.
+KhemStrix is not intended to immediately compete directly with large enterprise EDR platforms. Instead, the goal is to provide an accessible cybersecurity monitoring platform that can be deployed and managed by organizations with limited cybersecurity resources.
 
-### Model 1: Autonomous On-Premise (Private SME Node)
+The long-term vision is to support both:
 
-Designed for individual Cambodian businesses—such as clinics, accounting firms, and local logistics offices—that require total data privacy and operate on strict hardware budgets. In this model, the entire backend (FastAPI, PostgreSQL, and the management dashboard) runs locally on an existing office workstation or mini-PC inside the company LAN. The Go agent reports directly to this local node with zero outbound cloud dependencies. To run reliably on low-spec hardware without crashing, event ingestion uses an in-process asynchronous queue rather than external brokers like Redis, and detection relies on lightweight, offline-trained models. No company telemetry, email metadata, or file hashes ever leave the physical office network.
+1. **Private On-Premise Deployment** for organizations that want to keep security telemetry inside their own network.
+2. **Centralized Managed Deployment** for IT service providers or cybersecurity providers that want to manage multiple organizations from a central platform.
 
-### Model 2: Sovereign Managed Cluster (Centralized Multi-Tenant Hub)
+The core product value is simple:
 
-Designed for managed service providers, domestic telecom operators, or national cybersecurity authorities (such as MPTC and CamCERT) to deliver managed threat detection to micro-businesses that lack on-premise servers. In this model, the backend is hosted centrally in a domestic cloud facility. Hundreds of external organizations deploy the lightweight Go agent and point outbound over HTTPS to this central cluster. Strict multi-tenancy is enforced at the database layer via organization identifiers, ensuring complete data isolation between businesses while enabling the central platform to aggregate anonymized threat signatures into a collective national threat radar.
+> **KhemStrix helps organizations understand what is happening on their endpoints, detect suspicious activity, and respond before a security incident becomes more serious.**
 
-### Unified Architecture Strategy
+---
 
-To support both environments from day one, the team builds against the multi-tenant database schema and decoupled event pipeline immediately. For local SME use (Model 1), the system assigns all endpoints to a default organization identifier, operating as a self-contained node. When scaling to a centralized provider (Model 2), the identical server code simply registers additional organization records, eliminating the need to refactor database models or agent networking later.
+# 2. Problem Statement
 
-## 4. Phased Implementation Roadmap
+## 2.1 Limited Cybersecurity Visibility
 
+Many small and medium-sized organizations do not have continuous visibility into what happens on their computers and servers.
+
+They may not know:
+
+* Which processes are running
+* Which applications are connecting to external networks
+* Whether suspicious PowerShell commands are being executed
+* Whether repeated login attempts are occurring
+* Whether important files are being modified
+* Whether a phishing attack has led to malicious activity on an endpoint
+
+Traditional antivirus software may detect known malware, but organizations may still lack visibility into suspicious behavior and attack chains.
+
+For example:
+
+```text
+Employee receives phishing email
+        ↓
+Employee opens malicious document
+        ↓
+Document launches PowerShell
+        ↓
+PowerShell downloads additional payload
+        ↓
+Suspicious network connection
 ```
-┌───────────┐     ┌───────────┐     ┌───────────┐     ┌───────────┐
-│  Phase 1  │ ──► │  Phase 2  │ ──► │  Phase 3  │ ──► │  Phase 4  │
-│ Server &  │     │   Gmail   │     │ Telegram  │     │ Endpoint  │
-│ Agent Reg │     │ Phishing  │     │ Telemetry │     │ Logs      │
-└───────────┘     └───────────┘     └───────────┘     └─────┬─────┘
-                                                            │
-┌───────────┐     ┌───────────┐     ┌───────────┐           │
-│  Phase 7  │ ◄── │  Phase 6  │ ◄── │  Phase 5  │ ◄─────────┘
-│ Active    │     │ Incident  │     │ AI Engine │
-│ Response  │     │ Reporting │     │ & MITRE   │
-└───────────┘     └───────────┘     └───────────┘
+
+Without endpoint monitoring and event correlation, these activities may appear as separate and unrelated events.
+
+---
+
+## 2.2 Cost and Expertise Barrier
+
+Enterprise security products can be expensive and often require:
+
+* Dedicated security personnel
+* Security Operations Center capabilities
+* Complex deployment
+* Continuous monitoring
+* Security expertise
+
+Many smaller organizations cannot justify these costs.
+
+KhemStrix aims to reduce this barrier by providing a lightweight and practical security monitoring platform.
+
+---
+
+## 2.3 Limited Localized Security Solutions
+
+Organizations may prefer security solutions that:
+
+* Support local deployment
+* Minimize unnecessary data exposure
+* Are understandable for non-specialist IT administrators
+* Can be managed by local IT or cybersecurity providers
+* Provide actionable alerts rather than large volumes of raw logs
+
+KhemStrix aims to focus on these requirements.
+
+---
+
+# 3. Solution
+
+KhemStrix consists of four main layers:
+
+```text
+┌──────────────────────────────┐
+│       KhemStrix Agent        │
+│                              │
+│ Process Monitoring           │
+│ File Monitoring              │
+│ Authentication Monitoring    │
+│ Network Monitoring           │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│       Event Platform         │
+│                              │
+│ Event API                    │
+│ Event Queue / Buffer         │
+│ PostgreSQL Storage           │
+│ Agent Management             │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│      Detection Engine        │
+│                              │
+│ Rule-Based Detection         │
+│ Behavioral Analysis          │
+│ AI / ML Detection            │
+│ Risk Scoring                 │
+│ MITRE ATT&CK Mapping         │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│      Security Dashboard      │
+│                              │
+│ Alerts                       │
+│ Attack Timeline              │
+│ Endpoint Status              │
+│ Incident Reports             │
+│ Response Actions             │
+└──────────────────────────────┘
 ```
 
-### Phase 1: Server Infrastructure, Agent Registration & Lifecycle Validation
+The development approach will start with reliable telemetry and simple detection rules before introducing more advanced AI models.
 
-**Objective:** Establish the foundational client-server communication, authentication, database schemas, and background execution loops.
+The principle is:
 
-**Key Deliverables:**
-- FastAPI backend with PostgreSQL persistence and full UTC timezone alignment.
-- Multi-tenancy anchor (`organizations` table) with default tenant scoping.
-- Go binary with static compilation for Windows (`.exe`) and Linux (cross-compiled via `GOOS=linux`).
-- One-line chained installer for PowerShell and Bash.
-- Background service registration: Linux systemd unit and Windows Service execution.
-- Dynamic network metadata sync (`ip_address` and `mac_address`) on active heartbeats (`POST /agent/heartbeat`).
-- Web dashboard for fleet visibility, agent revocation, reactivation, and hard deletion.
+> **First collect good security data. Then detect suspicious behavior. Then improve detection using AI and machine learning.**
 
-**Current Status:** Complete & Fully Tested.
+---
 
-### Phase 2: Email Telemetry & Phishing Pipeline (Gmail / IMAP)
+# 4. Deployment Models
 
-**Objective:** Detect inbound email phishing, credential harvesting lures, and malicious attachments targeting employee inboxes.
+## Model 1 — Private On-Premise Deployment
 
-**Key Deliverables:**
-- Lightweight Go module to read incoming mail streams (IMAP / Google Workspace APIs).
-- In-memory attachment processor: computes SHA-256 hashes locally and discards raw file bytes to preserve corporate confidentiality.
-- Standard event packaging adhering to the project's core JSONB schema envelope.
-- In-process `asyncio.Queue` on FastAPI to absorb batch flushes from agents without database connection pool exhaustion.
-- Initial detection checks: header anomalies (SPF/DKIM/DMARC status), domain lookalikes, and VirusTotal hash reputation lookups against a local query cache.
+KhemStrix can be deployed inside an organization's own network.
 
-### Phase 3: Telegram Security Telemetry (Feasibility & Ingestion Research)
+```text
+Endpoint Agent
+      │
+      ▼
+Local KhemStrix Server
+      │
+      ├── FastAPI Backend
+      ├── PostgreSQL
+      └── Security Dashboard
+```
 
-**Objective:** Investigate and prototype security telemetry collection for Telegram desktop environments, addressing Cambodia's primary workplace communication vector.
+Security events remain within the organization's infrastructure.
 
-**Key Deliverables:**
-- Technical feasibility study on detecting malicious file downloads, suspicious `.tapp`/bot execution links, and unauthorized session establishment via Telegram Desktop.
-- Mechanism design: local download directory monitoring (`Telegram Desktop/Downloads`) vs. Telegram Bot API gateway integrations.
-- Feature extraction: hashing incoming files downloaded through the app and flagging lookalike domains distributed in corporate group chats.
-- Event contract extension: mapping Telegram-derived alerts into the standard events schema under `event_type: "messaging_threat"`.
+This model may be suitable for:
 
-### Phase 4: Endpoint Core System Telemetry
+* Clinics
+* Accounting firms
+* Educational institutions
+* Organizations handling sensitive information
+* Businesses with strict privacy requirements
 
-**Objective:** Expand the Go agent into a true system monitor capturing host-level activity beyond communication apps.
+---
 
-**Key Deliverables:**
-- **Process Monitoring:** Tracking process spawn events, parent-child relationships (e.g., `word.exe` spawning `powershell.exe`), and command-line execution flags.
-- **File Integrity Monitoring (FIM):** Tracking unauthorized file modifications, creations, and extension changes across sensitive directories (`/etc`, `System32`, user Desktop).
-- **Authentication & Login Auditing:** Capturing interactive and remote login attempts, failed logon spikes, privilege escalations, and SSH/RDP session states.
-- **Network Socket Logging:** Recording active outbound socket connections (remote IP, target port, binary binding) to detect Command-and-Control (C2) callbacks.
-- **Agent-side ring buffering:** thread-safe caching (50 events / 20s flush with jitter) to ensure zero log loss during network drops.
+## Model 2 — Centralized Managed Platform
 
-### Phase 5: AI-Driven Analytics & MITRE ATT&CK Mapping
+A central KhemStrix platform can manage multiple organizations.
 
-**Objective:** Transform raw, noisy system and communication logs into categorized, high-confidence security incidents.
+```text
+Organization A Agents ──┐
+Organization B Agents ──┼──► KhemStrix Platform
+Organization C Agents ──┘
+                              │
+                              ▼
+                       Multi-Tenant System
+                              │
+                              ▼
+                     Security Management
+```
 
-**Key Deliverables:**
-- **NLP / Social Engineering Classifier:** Offline-trained model (TF-IDF / LightGBM or fine-tuned DistilBERT) evaluating email and chat intent to flag urgency manipulation, brand spoofing (e.g., ABA Bank, Wing), and credential traps without storing raw text.
-- **System Anomaly Detection:** Behavioral models spotting anomalous execution chains and Living-off-the-Land Binaries (LOLBins).
-- **MITRE ATT&CK Tagging:** Automated normalization engine that labels alerts with precise tactical IDs:
-  - Initial Access: Phishing (T1566)
-  - Execution: Command and Scripting Interpreter (T1059)
-  - Persistence: Create or Modify System Process (T1543)
-  - Command and Control: Application Layer Protocol (T1071)
-- Monthly time-partitioned PostgreSQL storage (`events_YYYY_MM`) for scalable retention and compliance reporting.
+This model could eventually allow:
 
-### Phase 6: Automated Incident Reporting, Mitigations & Remediation Guidance
+* IT service providers
+* Managed Security Service Providers
+* Cybersecurity companies
 
-**Objective:** Provide actionable, plain-language intelligence tailored for non-specialist SME administrators and regulatory compliance audits.
+to provide managed cybersecurity monitoring to multiple customers.
 
-**Key Deliverables:**
-- Incident report generator synthesizing end-to-end attack timelines from the initial phishing trigger to endpoint persistence.
-- Clear remediation playbooks accompanying every alert:
-  - **Immediate Containment:** Instructions to revoke compromised credentials or disconnect affected network segments.
-  - **Mitigation:** System configuration hardening steps to block recurring techniques.
-- Audit export module producing standardized summary PDFs aligned with MPTC incident reporting guidelines and NBC audit checklists.
+---
 
-### Phase 7: Active Response & Automated Containment
+# 5. Development Roadmap
 
-**Objective:** Move from passive detection to active threat neutralization, containing attacks before lateral movement occurs.
+The project will follow a revised development roadmap.
 
-**Key Deliverables:**
-- Server-to-agent command dispatch pipeline (via persistent bidirectional channels or high-frequency polling).
-- **Process Termination:** Remote command execution to terminate malicious process trees (`kill -9 <PID>`).
-- **Endpoint Isolation:** Local firewall rule manipulation (Windows Filtering Platform / iptables) to sever all network connectivity except the secure heartbeat channel back to the KhemStrix server.
-- **Artifact Quarantine:** Moving suspicious downloads and dropped malware into an encrypted, isolated system directory.
-- **Safety UX:** Implementation of a "Human-in-the-Loop" confirmation flow on the React dashboard to prevent automated containment actions from accidentally disrupting core business workflows.
+Instead of immediately building email, Telegram, and AI features, KhemStrix will first establish a strong endpoint monitoring foundation.
 
-## 5. Team
+```text
+PHASE 1
+Agent Registration & Management
+        │
+        ▼
+PHASE 2
+Endpoint Telemetry
+        │
+        ▼
+PHASE 3
+Rule-Based Detection
+        │
+        ▼
+PHASE 4
+Email & Phishing Telemetry
+        │
+        ▼
+PHASE 5
+AI / ML Detection & MITRE ATT&CK
+        │
+        ▼
+PHASE 6
+Telegram / Additional Threat Telemetry
+        │
+        ▼
+PHASE 7
+Incident Reporting & Investigation
+        │
+        ▼
+PHASE 8
+Active Response & Containment
+```
 
-| Name | Focus Area | Role |
-|---|---|---|
-| Rong Sovannorth | Cybersecurity | Lead, Dev, Assists Research, AI and ML |
-| Roth Monyreach | Cybersecurity | Security Research, Assists Dev |
-| Kea Sophanh | AI and ML | AI and ML, Assists Research |
+---
+
+# 6. Phase 1 — Agent Registration and Management
+
+## Status: ✅ Completed / Current Foundation
+
+The first phase establishes communication between the KhemStrix endpoint agent and the backend platform.
+
+### Features
+
+* Endpoint agent registration
+* Agent authentication
+* Agent heartbeat
+* IP address synchronization
+* MAC address synchronization
+* Agent status monitoring
+* Agent activation and revocation
+* Endpoint management
+* Dashboard visibility
+
+### Architecture
+
+```text
+Go Agent
+    │
+    │ Register / Authenticate
+    ▼
+FastAPI Backend
+    │
+    ▼
+PostgreSQL
+    │
+    ▼
+Dashboard
+```
+
+This phase provides the foundation for future security telemetry.
+
+---
+
+# 7. Phase 2 — Endpoint Core Telemetry
+
+## Status: 🚧 Next Development Phase
+
+This is the current priority.
+
+The KhemStrix agent will begin collecting security-relevant events from the endpoint.
+
+---
+
+## 7.1 Process Monitoring
+
+The agent will monitor process creation and execution.
+
+Collected information may include:
+
+* Process name
+* Process ID
+* Parent Process ID
+* Parent process
+* Executable path
+* Command line
+* Username
+* Timestamp
+
+Example:
+
+```json
+{
+  "event_type": "process_start",
+  "process": "powershell.exe",
+  "pid": 4820,
+  "parent_process": "winword.exe",
+  "parent_pid": 3210,
+  "command_line": "powershell.exe -enc ...",
+  "username": "user",
+  "timestamp": "2026-09-10T10:30:00Z"
+}
+```
+
+Example suspicious behavior:
+
+```text
+winword.exe
+      ↓
+powershell.exe
+      ↓
+external network connection
+```
+
+This event chain may indicate suspicious activity and can later be analyzed by both rule-based and AI detection.
+
+---
+
+## 7.2 File Activity Monitoring
+
+The agent will monitor important directories for file activity.
+
+Events may include:
+
+* File created
+* File modified
+* File deleted
+* File renamed
+* File extension changed
+
+Initial focus may include:
+
+### Windows
+
+```text
+Downloads
+Desktop
+Important system directories
+```
+
+### Linux
+
+```text
+/etc
+/tmp
+Selected user directories
+```
+
+The goal is initially to collect reliable telemetry rather than immediately classify files as malicious.
+
+---
+
+## 7.3 Authentication Monitoring
+
+The system will collect authentication-related events such as:
+
+* Successful login
+* Failed login
+* Logout
+* Remote login
+* SSH sessions
+* RDP sessions
+* Privilege-related events
+
+Example:
+
+```text
+10 failed logins
+        ↓
+Successful login
+        ↓
+Suspicious process execution
+```
+
+Later phases can correlate these events into an attack timeline.
+
+---
+
+## 7.4 Network Monitoring
+
+The agent will collect network connection information.
+
+Example fields:
+
+```text
+Process
+Local IP
+Local Port
+Remote IP
+Remote Port
+Protocol
+Timestamp
+```
+
+Example:
+
+```text
+powershell.exe
+      ↓
+192.168.1.20:49152
+      ↓
+Suspicious-Remote-IP:443
+```
+
+---
+
+# 8. Event Pipeline
+
+Security collectors should not directly communicate with the database individually.
+
+Instead:
+
+```text
+Process Monitor ──┐
+File Monitor ─────┤
+Login Monitor ────┤
+Network Monitor ──┘
+                  │
+                  ▼
+              Event Queue
+                  │
+                  ▼
+             Event Batching
+                  │
+                  ▼
+             FastAPI Backend
+                  │
+                  ▼
+               PostgreSQL
+                  │
+                  ▼
+                Dashboard
+```
+
+The agent should also support temporary buffering if the server is unavailable.
+
+```text
+Event Generated
+      │
+      ▼
+Local Buffer
+      │
+      ├── Server Available ──► Send Event
+      │
+      └── Server Offline ────► Keep Temporarily
+                                      │
+                                      ▼
+                                Retry Later
+```
+
+---
+
+# 9. Phase 3 — Rule-Based Detection
+
+Before building complex AI models, KhemStrix will implement understandable security rules.
+
+Examples:
+
+### Rule 1 — Suspicious Parent-Child Process
+
+```text
+WINWORD.EXE
+       ↓
+POWERSHELL.EXE
+```
+
+Result:
+
+```text
+Alert: Suspicious Process Execution
+Severity: High
+```
+
+---
+
+### Rule 2 — Brute Force Attempt
+
+```text
+Multiple failed logins
+within a defined time period
+```
+
+Result:
+
+```text
+Alert: Possible Brute Force Attempt
+Severity: Medium / High
+```
+
+---
+
+### Rule 3 — Suspicious File Activity
+
+```text
+Executable created in Downloads
+        ↓
+Immediately executed
+```
+
+Result:
+
+```text
+Alert: Suspicious File Execution
+```
+
+---
+
+### Rule 4 — Suspicious Network Behavior
+
+```text
+Unusual process
+        ↓
+External connection
+```
+
+Result:
+
+```text
+Alert: Suspicious Network Connection
+```
+
+---
+
+# 10. Phase 4 — Email and Phishing Telemetry
+
+Once endpoint telemetry is working, KhemStrix can begin monitoring phishing-related events.
+
+Possible information:
+
+* Sender domain
+* SPF status
+* DKIM status
+* DMARC status
+* Suspicious URLs
+* Domain lookalikes
+* Attachment hashes
+* Email risk indicators
+
+Example attack chain:
+
+```text
+Phishing Email
+       ↓
+Malicious Attachment
+       ↓
+File Downloaded
+       ↓
+File Executed
+       ↓
+Suspicious Process
+       ↓
+Network Connection
+```
+
+The objective is not only to detect individual events, but eventually to reconstruct the entire attack chain.
+
+---
+
+# 11. Phase 5 — AI, Machine Learning and MITRE ATT&CK
+
+AI and ML will be introduced after sufficient telemetry and datasets are available.
+
+The AI/ML system may include:
+
+## Phishing Classification
+
+Example:
+
+```text
+Email Content / Metadata
+          │
+          ▼
+   Feature Extraction
+          │
+          ▼
+      ML Model
+          │
+          ▼
+      Risk Score
+```
+
+Output:
+
+```text
+Classification: Suspicious
+Risk Score: 94%
+
+Indicators:
+- Urgency manipulation
+- Brand impersonation
+- Suspicious domain
+- Credential request
+```
+
+---
+
+## Endpoint Behavioral Analysis
+
+The system can analyze events such as:
+
+* Parent-child process relationships
+* Command-line behavior
+* Process frequency
+* Login patterns
+* Network connections
+* File activity
+
+Example:
+
+```text
+Normal Behavior
+       │
+       ▼
+Behavioral Analysis
+       │
+       ▼
+Suspicious / High Risk
+```
+
+---
+
+## Risk Scoring
+
+KhemStrix may combine multiple detection signals.
+
+```text
+Rule Detection ───┐
+                  │
+AI Detection ─────┼──► Risk Scoring
+                  │
+Threat Intelligence┘
+                        │
+                        ▼
+                      Alert
+```
+
+Example:
+
+```text
+Rule Score:        70
+AI Score:          85
+Network Risk:      60
+
+Final Risk Score:  High
+```
+
+---
+
+## MITRE ATT&CK Mapping
+
+Detected activity can be mapped to relevant MITRE ATT&CK techniques.
+
+Example:
+
+```text
+Suspicious PowerShell Execution
+        ↓
+MITRE ATT&CK
+        ↓
+T1059
+Command and Scripting Interpreter
+```
+
+This helps cybersecurity analysts understand the behavior in a standardized format.
+
+---
+
+# 12. Phase 6 — Telegram and Additional Security Telemetry
+
+Telegram may later become a Cambodia-specific research and detection feature.
+
+Possible research areas include:
+
+* Monitoring downloaded files
+* Hashing suspicious downloaded files
+* Detecting suspicious links
+* Detecting lookalike domains
+* Monitoring potentially dangerous file types
+
+The objective is not to unnecessarily collect private conversations.
+
+The focus should be on security-relevant metadata and locally observable security events.
+
+---
+
+# 13. Phase 7 — Incident Reporting and Investigation
+
+Once events and detections are available, KhemStrix will generate incident timelines.
+
+Example:
+
+```text
+09:10 — Phishing email received
+09:12 — Attachment downloaded
+09:13 — File executed
+09:13 — PowerShell started
+09:14 — External connection detected
+09:15 — Alert generated
+```
+
+The dashboard can provide:
+
+* Incident timeline
+* Affected endpoint
+* Related events
+* Severity
+* MITRE ATT&CK techniques
+* Recommended mitigation
+
+The system may also generate security reports for organizations.
+
+---
+
+# 14. Phase 8 — Active Response and Containment
+
+This phase will be developed only after detection accuracy and reliability have been validated.
+
+Possible response actions:
+
+* Terminate suspicious processes
+* Quarantine suspicious files
+* Isolate an endpoint
+* Block suspicious network connections
+
+Example:
+
+```text
+Threat Detected
+       │
+       ▼
+Security Alert
+       │
+       ▼
+Analyst / Administrator Review
+       │
+       ├── Approve ──► Containment
+       │
+       └── Reject ───► Continue Monitoring
+```
+
+Human confirmation should be prioritized before high-impact automated actions.
+
+---

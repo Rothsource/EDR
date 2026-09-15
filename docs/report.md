@@ -1,300 +1,317 @@
-# KhemStrix EDR: Master Project Status & Scalable Architecture Report
+# KhemStrix EDR — WebSocket Durable Delivery: Full Status Report
+**As of September 15, 2026**
 
-## 1. Executive Summary & Cambodia Context
+---
 
-KhemStrix EDR is an open-source-based, AI-enhanced Endpoint Detection & Response (EDR) platform designed for small-to-medium enterprises (SMEs) in Cambodia. Commercial EDR products (CrowdStrike, SentinelOne, Microsoft Defender for Endpoint) impose enterprise-tier USD licensing, heavy endpoint footprints, and require dedicated SOC analysts that local organizations cannot afford.
+## 1. What Is This Project, Briefly
 
-The project is modeled after South Korea's AhnLab — establishing a domestic, cost-effective detection foundation that aligns directly with Cambodian regulatory demands:
+KhemStrix EDR is an Endpoint Detection & Response (EDR) system for small-to-medium businesses in Cambodia. An "agent" (a small program) runs on each employee's computer, watches for suspicious activity (phishing emails, malware, brute-force login attempts), and reports what it sees back to a central server, where it's stored and analyzed.
 
-- **MPTC Draft Law on Cybersecurity**: Mandatory audit logging, threat monitoring, and incident reporting for critical information infrastructure and digital service operators.
-- **MPTC Draft Law on Personal Data Protection**: Clear boundaries around data minimization, requiring that employee personal communications are never intercepted or exported without statutory cause.
-- **National Bank of Cambodia (NBC) TCRMG Guidelines**: Technology and Cyber Risk Management requirements mandating endpoint auditability and rapid incident containment.
+This report covers one specific piece of that system: **how events get from the agent to the server reliably**, even when the network connection is unstable.
 
-```
-┌────────────────────────────────────────────────────────┐
-│             DUAL-MODEL ARCHITECTURAL BRIDGE            │
-│                                                        │
-│  MODEL 1: PRIVATE SME NODE (NOW)                       │
-│  • Fully local LAN deployment inside SME office        │
-│  • Single default organization in database             │
-│  • In-process Python queue (no Redis/broker daemons)   │
-│  • Real-time email inference (raw body dropped)        │
-│                                                        │
-│                           │ Upgrades seamlessly        │
-│                           ▼ with zero code rewrite     │
-│                                                        │
-│  MODEL 2: CENTRALIZED MPTC/CamCERT HUB (FUTURE)        │
-│  • National sovereign threat grid across many SMEs     │
-│  • Native multi-tenant isolation (organizations table) │
-│  • Swap in-process queue for distributed message bus   │
-│  • Aggregated threat telemetry for national defense    │
-└────────────────────────────────────────────────────────┘
-```
+---
 
-## 2. Done and Tested (Phase 1.0 Milestone)
+## 2. What Is a WebSocket? (Explained Simply)
 
-Every item below is implemented, compiled, and verified across separate physical machines and virtual environments.
+Before the problem and solution make sense, it helps to understand the tool at the center of this work.
 
-```
-[ Kali Linux / Windows Endpoint ]                 [ Windows Host Server ]
-┌───────────────────────────────┐                 ┌───────────────────────┐
-│ khemstrix-agent (Go)          │                 │ FastAPI + PostgreSQL  │
-│ • Static single binary        │   HTTP JSON     │ • Token Registration  │
-│ • Systemd & Windows Service   ├────────────────►│ • Dynamic IP/MAC sync │
-│ • Auto-persists config.json   │                 │ • UTC Serializer      │
-└───────────────────────────────┘                 └───────────────────────┘
-                                                              │
-                                                              ▼
-                                                  ┌───────────────────────┐
-                                                  │ React + Vite Shell    │
-                                                  │ • One-line installer  │
-                                                  │ • Revoke/Delete/Live  │
-                                                  └───────────────────────┘
-```
+### The old way: REST (like sending letters)
 
-### Backend — Core Connectivity & Life Cycle
+Most web communication works like mailing a letter. Your computer (the "client") sends a request to a server — "here's an event that happened" — the server replies "got it" — and then the connection closes completely. If you have ten events, you send ten separate letters, each with its own trip there and back.
 
-- **Database Pipeline**: PostgreSQL tables (`enrollment_tokens`, `agents`, `users`) verified active and responsive via `psql`.
-- **ORM Mapping**: Synchronized schema chain: `config.py` → `db/database.py` → `db/models.py`.
-- **Storage Timezone Normalization**: Eliminated naive vs. aware datetime conversion mismatches across PostgreSQL `timestamp without time zone` columns.
-- **UTC Serialization Fix**: Added explicit `@field_serializer` to `schemas/agent.py` forcing naive UTC datetimes to render ISO-8601 strings with an explicit `+00:00` offset. Resolved browser timeline bugs where UTC+7 clients (Phnom Penh) displayed events as occurring "7 hours ago".
-- **Registration & Enrollment**: `POST /admin/generate-token` issues single-use, 1-hour expiration tokens. `POST /agent/register` converts tokens to permanent `api_keys` and records hardware metadata.
-- **Dynamic IP/MAC Heartbeat Refresh**: `POST /agent/heartbeat` validates `agent_id` + `api_key` + active status. It dynamically refreshes stored `ip_address` and `mac_address` whenever an endpoint renews its DHCP lease, activates a VPN, or switches subnets.
-- **Administrative Controls**: `PATCH /admin/agents/{agent_id}/revoke` cuts off heartbeat checks with immediate 401 Unauthorized responses. `PATCH /admin/agents/{agent_id}/unrevoke` seamlessly reinstates agents without requiring re-registration. `DELETE /admin/agents/{agent_id}` removes records from inventory.
-- **Binary Distribution**: `routers/downloads.py` serves compiled agents (`khemstrixAgent.exe`, `khemstrixAgent`) with absolute filesystem pathing derived from `__file__`, eliminating uvicorn working-directory errors.
+This is called **REST**, and it's how the agent used to work: it collected events for up to 20 seconds (or until it had 50 of them), then sent them all in one batch.
 
-### Go Endpoint Agent (khemstrix-agent)
+**The problem with this**: if something urgent happens — like ransomware starting to encrypt files — waiting up to 20 seconds before even telling the server about it is far too slow. Real damage can happen in that window.
 
-- **Clean Single Binary**: Dependency-free compilation on Windows (`.exe`) and Linux (cross-compiled via `GOOS=linux` from Windows).
-- **Unified Network Extraction**: `internal/core/netinfo.go` traverses interfaces and extracts the IPv4 address and MAC address simultaneously from the active NIC, skipping loopback and inactive links.
-- **Local Persistence**: `internal/config/config.go` persists runtime settings to `C:\ProgramData\khemstrix-agent\config.json` (Windows) or `/etc/khemstrix-agent/config.json` (Linux).
-- **Persistent Execution**: Verified running as a native systemd unit on Linux and as a background service on Windows without holding open interactive terminal windows.
-- **State Machine**: Automatically chooses startup mode: runs the heartbeat loop if `config.json` is present; requires `--token`, enrolls with the server, writes configuration, and transitions into the heartbeat loop if absent.
+### The new way: WebSocket (like a phone call)
 
-### Management Web Dashboard (React + Vite)
+A **WebSocket** is different. Instead of sending separate letters, the client and server **open one continuous connection and keep it open**, like a phone call. Once connected, either side can talk to the other *at any moment*, instantly, without setting up a new connection each time.
 
-- **Live Fleet Table**: Real-time visibility into hostnames, OS, dynamically refreshed IP/MAC addresses, and connection status badges (Online, Offline, Revoked).
-- **Fleet Actions**: Wired interactive confirmation modals for agent revocation, reactivation, and permanent deletion.
-- **Chained One-Line Installer**: Dynamic generation of copy-paste installation commands for Windows PowerShell and Linux Bash using the backend server's LAN-accessible IP address.
+Think of it like this:
+- **REST** = texting someone, one message at a time, and waiting for a reply before sending the next.
+- **WebSocket** = calling someone and staying on the phone, so you can both talk back and forth instantly, whenever something comes up.
 
-## 3. Scalable Architecture Foundations (Phase 1.1)
+For KhemStrix, this means: the moment the agent detects something suspicious, it can tell the server **immediately** — no 20-second delay, no waiting to batch things up.
 
-### 3.1 Database Multi-Tenancy Anchor
+### The catch: phone calls can drop
 
-- Create an `organizations` table as the root tenant entity.
-- Seed a static default UUID (`00000000-0000-0000-0000-000000000001`, "Default SME").
-- Add `tenant_id` foreign keys to `agents`, `enrollment_tokens`, and `events`.
-- **Why**: Model 1 runs cleanly as a single-tenant instance. Model 2 simply registers additional organization rows, and queries filter via `WHERE tenant_id = :current_tenant` without requiring schema migrations.
+Here's the tradeoff. A letter, once mailed, is out of your hands — the postal system deals with delivering it. But a phone call can just... drop. Wifi hiccups, a laptop goes to sleep, someone closes their laptop lid, the server itself restarts — any of these instantly kills a WebSocket connection, with **zero warning**.
 
-### 3.2 Time-Based Partitioning on Telemetry
+And when that happens, whatever you were "saying" at that exact moment — the event you were trying to send — can simply vanish, unless you've specifically built something to prevent that.
 
-- High-volume security logs rapidly degrade standard B-Tree indexing.
-- Partition the `events` table by `RANGE (timestamp)` in monthly increments (`events_2026_09`).
-- Telemetry past the Cambodian regulatory 90-day retention window can be dropped instantly via `DROP TABLE events_YYYY_MM`, avoiding database vacuum locks.
+**This is the actual engineering problem this whole report is about**: making sure that when the "phone call" drops, nothing important gets lost.
 
-### 3.3 Ingestion Transport — Superseded Design Note
+---
 
-The original plan for this section was edge-side batching (agent buffers up to 50 events or 20 seconds, then flushes over REST into an `asyncio.Queue`). **That plan has since been replaced.** The batching approach is fine for routine telemetry, but too slow for urgent detections — ransomware or brute-force login activity needs the server to know immediately, not up to 20 seconds later. Sections 3.4–3.7 below describe the design that replaced it, and its real, current implementation status.
+## 3. The Problem, Precisely
 
-### 3.4 The Problem: What Happens When a Persistent Connection Dies
+The agreed starting point: replace slow batching with an always-on WebSocket connection, so urgent events reach the server instantly.
 
-Moving to a persistent WebSocket solves the latency problem — events stream immediately, with zero agent-side classification logic. But it introduces a new one: a WebSocket doesn't degrade gracefully the way batched HTTP does. It just dies — from wifi loss, laptop sleep, a proxy, or the server itself going down — and anything in flight at that moment is lost unless handled explicitly. Designing for that failure mode was the core of this phase's work.
+But a WebSocket doesn't degrade gracefully — it just dies. So the real question this phase of work had to answer was:
 
-### 3.5 The Agreed Design
+> **What happens to an event if the connection drops at the exact moment we're trying to send it?**
 
-- **Durable local outbox (SQLite):** every event is written to disk on the endpoint the moment it's generated, before any send is attempted. It is never deleted on send — only once the server confirms receipt. Status flow: pending → sent-but-unacknowledged → acknowledged (row removed).
-- **On disconnect:** nothing special has to happen — the event was already safe on disk the instant it was written.
-- **On reconnect:** the agent sends the server its list of currently-unacknowledged event IDs; the server replies with which of those it already has; the agent resends only what's genuinely missing. One round trip, not one request per event.
-- **Idempotent insert is the real safety net:** the server's insert is keyed on the event ID with "do nothing on conflict," so even a duplicate resend is a harmless no-op. Correctness never depends on the reconcile step working perfectly.
-- **Heartbeat is server-initiated:** the server pings roughly every 10 seconds; the agent just replies and resets a timer. If the agent misses 2-3 pings in a row (roughly 20-30 seconds), it assumes the connection is dead, stops trying to push, and lets events accumulate safely in the outbox.
-- **Reconnection is agent-initiated**, independent of the heartbeat, using exponential backoff with random jitter — this avoids every agent in the fleet retrying in the same instant if the server itself is what went down.
-- **REST keeps a narrow, secondary role:** it only helps in the specific case where a proxy blocks the WebSocket upgrade but the network is otherwise fine. A full outage defeats REST too — the durable outbox is what actually protects against that case, not a REST fallback.
+Without an answer to that question, moving to WebSockets would trade "sometimes slow" for "sometimes silently loses data" — completely unacceptable for a security product, where a missed detection is exactly the kind of failure that matters most.
 
-### 3.6 Status: Server Side — Done and Tested
+---
 
-| Component | File | Status |
-|---|---|---|
-| Message schemas | `server/app/schemas/ws.py` | Done — auth, event, ack, reconcile request/response, ping/pong, and error message shapes |
-| Connection registry | `server/app/core/ws_manager.py` | Done |
-| WebSocket route | `server/app/routers/ws.py` | Done — handles the auth handshake, idempotent event insert, sending acks, and reconciliation |
-| Heartbeat loop | `server/app/core/ws_heartbeat.py` | Done — pings roughly every 10 seconds, disconnects an unresponsive agent after about 30 |
+## 4. The Solution — How We Solved It
 
-Verified end-to-end: the auth handshake accepts good credentials and rejects bad or malformed ones; heartbeat ping/pong keeps a connection alive; an idle connection is correctly evicted after missed pongs; an event sent over the socket is inserted and acknowledged, with the row confirmed directly in the database; reconciliation was tested by sending one real event ID and one fake one, and only the real one came back as known; the idempotent insert was confirmed to make duplicate sends harmless.
+The design has several pieces working together. Here's each one, explained plainly:
 
-One real bug was found and fixed during testing: the database's event-time column doesn't store timezone information, but incoming timestamps parse as timezone-aware on the server side, which the database driver rejects. The fix strips the timezone before insert. This is a good example of the kind of subtle mismatch that only surfaces once both sides are actually wired together and tested — worth keeping in mind for the Go agent's own timestamp handling as that work continues.
+### 4.1 A durable local "outbox" (the safety net)
 
-### 3.7 Status: Go Agent Side — In Progress
+Every event, the instant it's created, gets written to a small local database file on the endpoint's own hard drive (using SQLite — a lightweight, file-based database) — **before** the agent even tries to send it anywhere.
 
-**Important correction to an earlier version of this status:** an earlier internal status note claimed the agent-side outbox file and a supporting config helper were "already written," and referenced two agent source files (`core/net.go`, `core/http.go`) that turned out not to exist under those names in the real repository (the actual files are `core/netinfo.go` and `core/sender.go`). Before doing any further work, the actual file tree was checked directly, and the claimed-done outbox work did not, in fact, exist yet. It has since been written for real, listed below. The lesson carried forward: status write-ups describe intent until verified against the real repository.
+Think of it like writing a note in a notebook *before* you try to call someone to tell them the news. If the call drops, the note is still sitting in your notebook. You haven't lost anything — you just haven't delivered it yet.
 
-**Actually done and confirmed building successfully:**
+The event only gets erased from this notebook once the server explicitly confirms "yes, I received it." Not when it's sent — only when it's *confirmed*.
 
-- A small helper (`Dir()`) was added to `agent/internal/config/config.go` so other packages can locate the same directory as the agent's existing `config.json` / `state.json` without duplicating the OS-specific path logic.
-- The durable local outbox was written at `agent/internal/store/store.go` — a SQLite-backed store with the write/mark-sent/mark-acknowledged/list-unacknowledged/list-pending operations the design in 3.5 calls for. The new SQLite dependency was fetched and the agent module was confirmed to build cleanly with it in place.
-- The WebSocket client was written at `agent/internal/wsclient/wsclient.go` — handling the connect-and-authenticate handshake, replying to server pings and detecting a dead connection when they stop arriving, the reconcile-on-reconnect exchange described in 3.5, and the reconnect loop with exponential backoff and jitter. Its message formats were matched directly against the real `server/app/schemas/ws.py` field names rather than assumed. **This file has not yet been build-tested** — it depends on a UUID library that has not yet been fetched into the agent module (see 3.8, step 1).
+### 4.2 What happens when the connection drops
 
-**Not yet done:**
+Nothing special. That's the whole point. Because the event was already safely written to the local notebook the instant it was created, a dropped connection just means "the notebook has an unsent note in it." Nothing is lost — it's just waiting.
 
-- The WebSocket client has not yet been wired into the agent's main run loop (`agent/internal/core/run.go`), so it isn't actually running as part of the agent yet.
-- No detection module currently generates events to send — the email, process, network, file, and response modules under `agent/internal/modules/` don't yet call into the new WebSocket client. A temporary way to generate a test event will be needed before real integration testing can happen.
-- No integration testing has been performed yet — this is the most important gap. Nothing described here has been proven to work end-to-end against a live server.
+### 4.3 Reconnecting and catching up ("reconciliation")
 
-### 3.8 What's Left — Step by Step
+When the connection comes back, the agent doesn't just blindly resend everything in its notebook — that could be wasteful and sometimes send duplicates. Instead:
 
-1. **Fetch the remaining Go dependency and confirm the WebSocket client actually builds.** This is the first real build test of the new client code and the immediate next action.
-2. **Wire the WebSocket client into the agent's run loop**, so it starts alongside the existing heartbeat cycle, sharing the same agent credentials and shutdown handling.
-3. **Add a temporary way to generate a test event**, since no detection module produces one yet, so the integration test in step 4 has something real to send.
-4. **Run a full integration test against a live server:** disconnect the agent mid-stream (wifi off, or the server itself stopped), confirm the event lands safely in the local outbox file, bring the connection back, and confirm the server ends up with exactly one copy of the event — no loss, no duplication.
-5. **Run a reconnect-storm test:** start several agent instances at once, stop the server, bring it back, and confirm from the logs that their reconnect attempts are spread out rather than all landing in the same instant.
-6. **Known follow-ups, not blocking but worth tracking:** the local outbox needs a bounded-size policy so a very long outage can't fill the endpoint's disk unnoticed; the reconcile exchange should be chunked if a backlog gets very large; and the fact that a disconnected agent pauses detection entirely (rather than falling back to anything) is an accepted tradeoff that should be written down somewhere visible, such as an operations runbook.
+1. The agent sends the server a list: "here are the IDs of everything in my notebook."
+2. The server checks its own records and replies: "I already have these ones."
+3. The agent then resends only the ones the server said it didn't have.
 
-## 4. The Standard Event Contract
+This is one efficient back-and-forth, not one round-trip per event.
 
-**Note:** the field names below reflect the original design intent for this contract, but the event schema actually implemented and tested in `server/app/schemas/ws.py` uses different field names (classification-code style fields such as class/category/activity/type/severity identifiers, plus a generic data payload) rather than the `event_type` / `raw_data` / `extracted_features` shape shown here. The two should be reconciled — either update this section to match the real schema, or confirm the real schema needs to change to match this one — before more telemetry modules are built against either version.
+### 4.4 The real safety net underneath all of this
 
-Every future telemetry module (email phishing today; process execution, network sockets, and file integrity monitoring in Phase 2) was originally intended to adhere to this standard event envelope:
+Even if the reconciliation step above had a bug, or got skipped somehow, there's a deeper safety net: the server refuses to insert the same event twice, no matter how many times it receives it (this is called an "idempotent insert," keyed on a unique event ID). So even a duplicate, accidentally-resent event is completely harmless — it's just ignored the second time.
 
-```json
-{
-  "event_type": "email_phishing",
-  "timestamp": "2026-09-09T07:13:05Z",
-  "raw_data": {
-    "sender": "security@aba-verify-kh.com",
-    "subject": "Urgent: Your account is locked",
-    "links": ["http://login.aba-verify-kh.com/auth"],
-    "attachment_hashes": ["e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
-  },
-  "extracted_features": {
-    "has_brand_homoglyph": true,
-    "urgency_score": 0.92,
-    "attachment_is_executable": false
-  }
-}
-```
+### 4.5 The heartbeat (how anyone knows the phone call is still connected)
 
-- **Schema Independence via JSONB**: Metadata is indexed in formal relational columns, while dynamic fields reside in `raw_data` and `extracted_features`.
-- New endpoint monitoring capabilities can be added without running table migrations on existing deployments.
+Every 10 seconds or so, the server "pings" each connected agent — like saying "you still there?" — and the agent just replies "yep" and resets a timer. If the agent doesn't hear a ping for too long (about 20-30 seconds), it assumes the call has dropped, and switches into "just write everything to the notebook, don't try to call" mode until it reconnects.
 
-## 5. Threat Detection Strategy: AI NLP + VirusTotal
+### 4.6 Reconnecting without causing a stampede
 
-### The Dual-Risk Reality of Email Threats
+If the *server* is the one that went down (not just one agent's wifi), then when it comes back online, potentially **every single agent** in the whole company tries to reconnect at the exact same moment. That flood of simultaneous connections could overwhelm the server right as it's trying to recover.
 
-- **Malware Attachments**: Inbound payloads, malicious macros, and weaponized archives.
-- **Social Engineering / Pure Phishing**: Attacks containing no attachments at all (e.g., credential theft links, deceptive payment redirections, bank verification lures).
+The fix: each agent waits a random, slightly different amount of time before retrying (called "jitter"), so reconnections spread out naturally instead of all landing in the same instant.
 
-### Why VirusTotal Alone Is Insufficient
+---
 
-- **No File = No Value**: Over 70% of modern phishing attacks carry no attachment. VirusTotal provides zero visibility on pure social engineering text and novel phishing URLs.
-- **Zero-Day Blind Spots**: New malware or modified payloads produce unseen SHA-256 hashes, returning 0/70 Clean from VirusTotal.
-- **Severe Rate Limits**: VirusTotal's free public API allows only 4 requests/minute and 500 requests/day. A small office of 15 employees exhausts this quota within hours, resulting in HTTP 429 API lockouts.
-- **Privacy Risk of Direct File Uploads**: Uploading actual business files to VirusTotal exposes proprietary documents to security researchers globally.
+## 5. What We Have Actually Done and Verified
 
-### The Hybrid Multi-Layer Defense Engine
+This section only lists things that have been **built and tested against a real, running system** — not just designed or written.
 
-```
-                          INBOUND EMAIL TELEMETRY
-                                     │
-                                     ▼
-                    ┌─────────────────────────────────┐
-                    │  LAYER 1: Hard Heuristic Rules  │
-                    │  • Double extensions (.pdf.exe) │ ──► High Severity (Instant)
-                    │  • Known malicious TLDs         │
-                    └────────────────┬────────────────┘
-                                     │ Passed
-                                     ▼
-                    ┌─────────────────────────────────┐
-                    │  LAYER 2: VirusTotal Hash Check │
-                    │  • Query SHA-256 in local cache │ ──► Known Malware
-                    │  • If VT detections >= 3        │
-                    └────────────────┬────────────────┘
-                                     │ Clean / Unknown / No Attachment
-                                     ▼
-                    ┌─────────────────────────────────┐
-                    │  LAYER 3: Local NLP Model       │
-                    │  • Social engineering intent    │ ──► Score: 0.0 to 1.0
-                    │  • Urgency & psychological lure │     (Phishing Verdict)
-                    │  • Homoglyph/brand mismatch     │
-                    └─────────────────────────────────┘
+### 5.1 Server side — ✅ Fully built and tested
+
+| Piece | What it does |
+|---|---|
+| Message formats (`schemas/ws.py`) | Defines the exact shape of every message sent back and forth |
+| Connection tracker (`ws_manager.py`) | Keeps track of which agents are currently connected |
+| The WebSocket endpoint itself (`routers/ws.py`) | Handles login, receiving events, sending confirmations, and reconciliation |
+| Heartbeat loop (`ws_heartbeat.py`) | Pings every connected agent, disconnects unresponsive ones |
+
+**Confirmed by real testing**, not just by reading the code:
+- Logging in with correct credentials works; bad credentials are correctly rejected.
+- The heartbeat keeps a connection alive, and correctly disconnects one that goes silent.
+- Sending an event results in it being saved to the database and a confirmation being sent back — verified by directly querying the database and seeing the row.
+- Reconciliation correctly reports back only the events the server actually has, ignoring a fake ID we tested it with.
+- Sending the same event twice does not create a duplicate.
+
+One real bug was found and fixed along the way: the database stores times without time-zone information, but the incoming timestamps included one, which the database driver rejected. Fixed by stripping the time zone before saving. Worth remembering for the agent's own time-handling too.
+
+### 5.2 Agent side (the Go program running on each machine) — ✅ Fully built and tested
+
+| Piece | What it does |
+|---|---|
+| The local "notebook" (`internal/store/store.go`) | Saves events to a local file before sending, deletes them only once confirmed |
+| The WebSocket client (`internal/wsclient/wsclient.go`) | Connects, logs in, sends events, handles the heartbeat, reconnects automatically with the "avoid a stampede" delay, and reconciles on reconnect |
+
+**Confirmed by real, hands-on testing** (using two small temporary test programs built specifically to exercise this code, since no real detection module exists yet to naturally trigger it):
+
+- **The full happy-path round trip**: an event was created, written to the local notebook, sent live over the WebSocket, saved by the server, confirmed back to the agent, and correctly erased from the local notebook — all steps verified directly (by inspecting both the local file and the database).
+- **The actual disconnect/reconnect scenario** — the most important test of all: the server was deliberately shut down, and an event was created *while it was down*. We confirmed the event sat safely in the local notebook, untouched, for as long as the server stayed down (even confirmed a second event queued up the same way during the same outage). Once the server came back online, the agent automatically reconnected, reconciled, resent both queued events, got them confirmed, and the local notebook ended up completely empty again — with the database showing exactly two rows, no duplicates.
+
+This was a genuine, deliberate test of a real outage — not a lucky coincidence — and it worked exactly as designed on the first properly-controlled attempt.
+
+### 5.3 A note on process, for the record
+
+Along the way, several early status summaries turned out to be inaccurate — describing work as "done" when it hadn't been checked against the real files, or testing the wrong machine's credentials without realizing it, or hitting a file-permissions issue that had nothing to do with the actual code. Each of these was caught and corrected before being accepted as true. The lesson worth keeping: a status is not "done" until it's actually been run and observed, not just written down.
+
+---
+
+## 6. What Has NOT Been Done Yet
+
+Being equally clear about the gaps matters as much as the wins:
+
+1. **No real detection module exists yet.** Nothing in production actually calls the "send this event" function — everything verified so far used a temporary throwaway test program, not the real agent.
+2. **The WebSocket client is not wired into the real agent yet.** It has never run as part of `run.go` / the actual agent binary — only inside the separate test programs.
+3. **Reconnect-storm behavior is untested.** We've only ever tested with one single agent. We have not yet proven that many agents reconnecting at once actually spread out their retries via jitter, rather than all hitting the server at the same moment.
+4. **The local notebook has no size limit yet.** During a very long outage, it could theoretically grow without bound and fill up a disk. Needs a cap-and-alert policy — not urgent, but should not be forgotten.
+5. **Reconciliation isn't chunked.** If an agent were offline for a very long time with a huge backlog, the "here's my list of unsent IDs" message could get large. Probably fine in practice, but should be revisited if it becomes a real issue.
+6. **The event contract mismatch is unresolved.** An earlier design document describes a different event shape (`event_type`, `raw_data`, `extracted_features`) than what's actually implemented and tested (`class_uid`, `category_uid`, etc. plus a generic `data` field). These need to be reconciled before more detection modules get built against either one.
+
+---
+
+## 7. What We Need to Do Next — In Order
+
+### Step 1: Wire the WebSocket client into the real agent
+Right now, everything works only inside disposable test programs. The next concrete step is adding the WebSocket client into `agent/internal/core/run.go`, so it starts up automatically alongside the agent's existing heartbeat loop, using the same saved credentials — making this a real, permanent part of the agent rather than a side experiment.
+
+### Step 2: Run the reconnect-storm test
+Start several agent instances at once (can be done on one machine for now, pointed at the same server), stop the server, bring it back, and confirm from the logs that they don't all reconnect in the same instant — proving the "avoid a stampede" jitter logic actually works with more than one agent.
+
+### Step 3: Fix configuration precedence issues
+Two small but real cleanup items flagged earlier: remove a hardcoded server address from the Linux startup file, and make sure the agent always trusts its saved configuration file over any command-line flags it might be started with by accident.
+
+### Step 4: Add multi-tenant database support
+Create the `organizations` table structure, and add a `tenant_id` to the existing tables, so multiple separate companies can eventually use the same system without their data mixing — while today's single-company setup keeps working exactly as before.
+
+### Step 5: Reconcile the event contract
+Decide, once and for all, on a single agreed shape for what an "event" looks like, and update whichever document is wrong (the older design doc or the implementation) so future work isn't built against two different ideas of the same thing.
+
+### Step 6: Build the first real detection module — email phishing
+This is the first genuine, real-world source of events: the agent will connect to an employee's email, look at incoming messages, extract useful signals in memory (never saving the actual email content to disk, per Cambodia's data protection rules), and feed the result into the now-working WebSocket path built and tested above.
+
+### Step 7: Full real-world verification
+Once a real detection module exists, trigger an actual test phishing-style event, and confirm the entire path — from detection, to durable local storage, to WebSocket delivery, to database storage, to threat scoring — works correctly together, not just each piece in isolation.
+
+---
+
+## 8. How To Test This Yourself (After Pulling From GitHub)
+
+This section is for anyone (like a teammate) who pulls the repo fresh and wants to actually see the durable-delivery system working, not just read about it. It walks through the same steps we used to verify everything in Section 5.
+
+### 8.1 What you need running first
+
+You need **two things running before any test makes sense**:
+
+1. **The server**, with a PostgreSQL database it can reach.
+2. **A registered agent identity** — either a real agent, or a throwaway one you register just for testing.
+
+```powershell
+# 1. Start the server (from server/app/)
+cd server/app
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-- **Layer 1 (Fast Heuristics)**: Blocks dangerous file extensions (`.exe`, `.scr`, `.vbs`, `.iso`) and spoofed executable tricks locally in zero time.
-- **Layer 2 (Cached VirusTotal Lookups)**: Computes the SHA-256 hash of attachments in memory on the Go agent. Queries a local database hash cache first; queries VirusTotal only on cache misses, staying within rate limits while keeping raw files private.
-- **Layer 3 (Offline-Trained NLP Model)**: The primary brain. Evaluates message text and structure to detect credential phishing, urgency manipulation, and domain typosquatting.
+Keep this terminal open and visible — you'll be watching its logs during every test below.
 
-### Data Privacy & Regulatory Compliance (Zero Body Storage)
+### 8.2 Register an agent (skip if you already have one)
 
-To comply with Cambodia's draft data protection standards, the system operates on a zero-persistence principle for email bodies:
+You need a valid `agent_id` + `api_key` saved locally before any WebSocket test will work — the server rejects anyone it doesn't recognize.
 
-1. The Go agent extracts plain text, links, and headers in memory.
-2. The backend runs inference to determine threat probability and identify specific attack indicators (e.g., "brand_impersonation", "credential_harvesting").
-3. The raw email body is immediately purged from memory. It is never written to PostgreSQL or persisted to disk. Only the threat score, verdict, and extracted security indicators are stored for compliance audits.
+```powershell
+# Generate a one-time enrollment token (via the dashboard, logged in as an admin user,
+# or directly through the /admin/generate-token endpoint)
 
-## 6. Team Division of Labor: Systems Lead vs. AI Teammate
-
-```
-┌──────────────────────────────────────────────┐  ┌──────────────────────────────────────────────┐
-│         SYSTEMS LEAD (PROJECT LEAD)          │  │       AI & BACKEND (YEAR 3 TEAMMATE)         │
-├──────────────────────────────────────────────┤  ├──────────────────────────────────────────────┤
-│ 1. Fix Linux systemd flag precedence         │  │ 1. Curate public email phishing datasets     │
-│ 2. Audit Windows background service          │  │ 2. Generate synthetic Cambodian lures (ABA)  │
-│ 3. Build Go agent mutex Ring Buffer          │  │ 3. Train ML/NLP models (TF-IDF + Forest)     │
-│ 4. Build agent IMAP attachment hash extractor│  │ 4. Build `server/app/detection/email_scorer` │
-│ 5. Implement SendEvents() batch dispatcher   │  │ 5. Implement VirusTotal hash caching layer   │
-│ 6. Rebuild static cross-compiled binaries    │  │ 6. Run SQL multi-tenant database migration   │
-└──────────────────────┬───────────────────────┘  └──────────────────────┬───────────────────────┘
-                       │                                                 │
-                       └───────────────────►◄────────────────────────────┘
-                                     INTEGRATION TEST
-                           Simulated Phishing Event Ingestion
+# Then, from agent/:
+go run ./cmd/agent -server http://<server-ip>:8000 -token <the-token-you-generated>
 ```
 
-### Systems Lead Responsibilities (Core Infrastructure)
+This creates `config.json` (on Windows: `C:\ProgramData\khemstrix-agent\config.json`; on Linux: `/etc/khemstrix-agent/config.json`) containing your new `agent_id` and `api_key`. Confirm it worked:
 
-- **Service Precedence Resolution**: Remove hardcoded `--server=` arguments from `/etc/systemd/system/khemstrix-agent.service`. Ensure `cmd/agent/main.go` gives precedence to `config.json` over CLI flag defaults. *(Not started.)*
-- **Windows Service Verification**: Audit Windows service execution parameters to ensure runtime settings are not overridden. *(Not started.)*
-- **Durable Outbox** (`agent/internal/store/store.go`): SQLite-backed local store so no event is lost when the connection drops. *(Done, confirmed building.)* Supersedes the earlier ring-buffer plan — the outbox replaces in-memory buffering with something that survives a crash or restart, not just a network blip.
-- **WebSocket Client** (`agent/internal/wsclient/wsclient.go`): Persistent connection, authentication, heartbeat handling, reconnect with backoff and jitter, and reconciliation against the outbox on every reconnect. *(Written, not yet build-tested or wired in — see section 3.8.)* Supersedes the earlier `SendEvents()` batch-dispatcher plan — events stream immediately instead of waiting on a batch window.
-- **IMAP Telemetry Module** (`agent/internal/modules/email/`): Connect via IMAP, extract headers, extract links, compute attachment SHA-256 hashes in memory, and purge raw bytes. *(Not started — this is also the first real source of events the WebSocket client will have once it exists.)*
-- **Binary Pipeline**: Cross-compile updated binaries and maintain files in `server/app/static/binaries/`. *(Not started for this phase.)*
+```powershell
+Get-Content C:\ProgramData\khemstrix-agent\config.json
+```
 
-### AI Teammate Responsibilities (Machine Learning & Ingestion)
+**Important — file permissions**: if a Windows service has run on this machine before, the files in that folder may be locked to admin-only access. If later steps fail with a "readonly database" error, run this once, from an elevated (Administrator) PowerShell:
 
-- **Dataset Curation & Preprocessing**: Assemble public phishing corpora (Nazario, SpamAssassin, Kaggle, Hugging Face). Generate synthetic samples modeling local Cambodian lures (ABA Bank, Canadia, Wing, Telegram verification).
-- **Model Training & Evaluation**: Train a baseline tabular classifier (TF-IDF vectorizer + Random Forest / XGBoost) on phishing language, urgency indicators, and link patterns. Evaluate precision, recall, and false-positive rates for her academic defense.
-- **Export Trained Pipeline**: Serialize the model and vectorizer to `.joblib` artifacts for integration into FastAPI.
-- **FastAPI Scoring Pipeline** (`server/app/detection/email_scorer.py`): Load artifacts into memory on startup; accept incoming event text and features; return threat probabilities, risk tiers (safe, suspicious, malicious), and threat indicators.
-- **VirusTotal Hash Cache Client**: Build `server/app/detection/virustotal.py` to query SHA-256 hashes against a local cache table before consuming public API quotas.
-- **Database Migration & Schemas**: Execute SQL migration for `organizations` and partitioned `events`; implement `schemas/event.py` with the UTC serializer. *(Not started.)* The `asyncio.Queue` worker item is superseded — events now arrive over the persistent WebSocket route (`server/app/routers/ws.py`) rather than a queued REST endpoint, so no separate queue worker is needed for this path.
+```powershell
+icacls C:\ProgramData\khemstrix-agent /grant Users:F /T
+```
 
-## 7. Next Implementation Steps (Priority Order)
+### 8.3 Build the two test tools
 
-This replaces the previous step list, which was written against the retired REST-batching design (`asyncio.Queue`, `POST /agent/events`, agent-side ring buffer). The transport decision has since moved to the persistent WebSocket design in section 3, so the steps below reflect that instead.
+These are small, throwaway programs (not part of the real agent) built specifically to exercise the outbox and WebSocket client directly, since no real detection module exists yet.
 
-### Step 1: Finish and Prove Out the WebSocket Agent Path
-- Fetch the one remaining Go dependency the WebSocket client needs and confirm the agent module still builds cleanly.
-- Wire the WebSocket client into the agent's main run loop (`agent/internal/core/run.go`) so it runs alongside the existing heartbeat cycle.
-- Add a temporary way to generate a test event, since no real detection module exists yet.
-- Run the full disconnect/reconnect integration test described in section 3.8, confirming no event is lost and none is duplicated.
-- Run the reconnect-storm test with several agent instances to confirm jitter is actually spreading out reconnect attempts.
+```powershell
+cd agent
 
-### Step 2: Configuration & Service Precedence Fix
-- Remove the hardcoded `--server=` flag from the Linux systemd unit file and reload the daemon.
-- Ensure `cmd/agent/main.go` gives priority to the values already saved in `config.json` over CLI flag defaults.
+# Pushes one fake event and watches for confirmation
+go build -o testpush.exe ./cmd/testpush
 
-### Step 3: Database Multi-Tenancy & Partitioning
-- Run the SQL migration to create the `organizations` table and add `tenant_id` to the existing tables.
-- Create the monthly partitioned events table with indexes appropriate for tenant- and agent-scoped queries.
-- Update the SQLAlchemy models in `server/app/db/models.py` to match.
+# Same as above, but waits much longer — gives you time to manually kill the server mid-test
+go build -o testreconnect.exe ./cmd/testreconnect
 
-### Step 4: Reconcile the Event Contract
-- Resolve the mismatch flagged in section 4 between the originally-designed event envelope and the event schema actually implemented in `server/app/schemas/ws.py`, so every future telemetry module (email, process, network, file integrity) is built against one agreed shape rather than two conflicting ones.
+# Prints whatever is currently sitting in the local outbox file, unsent
+go build -o dumpoutbox.exe ./cmd/dumpoutbox
+```
 
-### Step 5: First Real Telemetry Module — Email Phishing Detection
-- Build the IMAP telemetry module (`agent/internal/modules/email/`) as the agent's first real event source, feeding the now-working WebSocket path from Step 1 instead of sitting idle behind it.
-- Curate and preprocess phishing datasets, train the baseline classifier, and export the trained pipeline as planned in section 6.
-- Build the FastAPI scoring pipeline (`server/app/detection/email_scorer.py`) and the VirusTotal hash-cache client, and hook scoring into the event path that now exists.
+*(If these `cmd/` folders don't exist in your checkout yet, ask whoever wrote this report for the three `main.go` files — they're intentionally not part of the permanent codebase.)*
 
-### Step 6: End-to-End System Verification
-- Trigger a real phishing-style test event from the IMAP module and confirm it streams over the WebSocket, lands in PostgreSQL, and is correctly scored.
-- Confirm raw email bodies are never written to disk, per the zero-persistence requirement in section 5.
-- Confirm the durable-delivery guarantees from section 3 still hold with a real detection module in the loop, not just a synthetic test event.
+### 8.4 Test 1 — The happy path (server stays up the whole time)
+
+```powershell
+.\testpush.exe
+```
+
+**What you should see:**
+- A `DEBUG agent_id=... api_key=... server=...` line confirming which identity it's using
+- `pushing test event <uuid>`
+- No errors
+
+**Then confirm it actually landed**, in Postgres:
+```sql
+SELECT event_id, hostname, data, created_at FROM events WHERE hostname = 'testpush-harness' ORDER BY created_at DESC;
+```
+
+**And confirm the local notebook is empty again** (meaning it got confirmed and cleaned up):
+```powershell
+.\dumpoutbox.exe
+```
+Should print `outbox is empty — no unacked events remain`.
+
+### 8.5 Test 2 — The real test: surviving a dropped connection
+
+This is the test that actually proves the whole point of this design.
+
+**Step 1 — Stop the server completely.** Go to its terminal and press `Ctrl+C`. Confirm it's really down:
+```powershell
+Test-NetConnection -ComputerName <server-ip> -Port 8000
+```
+Should show `TcpTestSucceeded : False`.
+
+**Step 2 — With the server confirmed down, run:**
+```powershell
+.\testreconnect.exe
+```
+It will try to push an event, fail to reach the server (expected), and then sit waiting for up to 120 seconds.
+
+**Step 3 — While it's still waiting, in a second terminal, check the outbox:**
+```powershell
+.\dumpoutbox.exe
+```
+You should see the event still sitting there, unsent — this is the proof that nothing was lost.
+
+**Step 4 — Now restart the server:**
+```powershell
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+**Step 5 — Watch `testreconnect.exe`'s terminal.** Within a few seconds it should reconnect on its own, with no further action from you.
+
+**Step 6 — Once its timer finishes, check the outbox one more time:**
+```powershell
+.\dumpoutbox.exe
+```
+Should now say it's empty again — meaning the event that survived the outage was automatically resent and confirmed.
+
+**Step 7 — Confirm in Postgres there's exactly one copy, not two:**
+```sql
+SELECT event_id, hostname, created_at FROM events WHERE hostname = 'reconnect-test' ORDER BY created_at DESC;
+```
+
+If all seven steps check out, you've personally reproduced the exact test that validated this design — not just read that someone else did it.
+
+### 8.6 Common gotchas (things that tripped us up, so you don't repeat them)
+
+- **Run the test tools on the same machine where the agent is actually registered.** `config.json` is local to whatever machine you're on — running the test tool from a different computer (e.g. your host instead of a VM) will read a *different* config file with different (possibly stale or nonexistent) credentials, and fail with a confusing "invalid credentials" error that has nothing to do with the actual code.
+- **A leftover Windows service can lock the outbox file.** If you get a "readonly database" error, check `Get-Service | Where-Object { $_.Name -like "*khemstrix*" }` — if one is running, stop it first, and fix folder permissions as shown in 8.2.
+- **`--reload` on uvicorn can auto-restart the server on file changes**, which can accidentally interrupt your test at the wrong moment. If you're actively editing files nearby while testing, that restart isn't a real "server crashed" test — do a deliberate `Ctrl+C` instead, and don't touch files mid-test.
+- **Double-check which agent's credentials you're actually testing with** if your project has multiple registered agents (e.g. from earlier testing) — a stale or deleted agent's credentials will always fail auth, even though the failure looks identical to a real bug.
+
+---
+
+## 9. One-Sentence Summary
+
+**The problem**: switching to instant delivery (WebSockets) risked losing security events whenever a connection dropped. **The solution**: never delete an event until the server confirms it, and automatically catch up on reconnect. **Status**: this solution has now been built and genuinely proven to survive a real server outage without losing or duplicating a single event — the next job is making it a permanent part of the real agent, instead of a test experiment.
