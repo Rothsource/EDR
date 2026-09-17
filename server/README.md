@@ -1,515 +1,201 @@
-# EDR Project — Architecture & Scaling Guide
+# Project Blueprint: KhemStrix EDR
 
-This is your reference doc for understanding what each file does, and the exact
-checklist to follow every time you add a new table or feature.
+## 1. Executive Summary
 
----
+KhemStrix EDR is an open-source-based, AI-enhanced Endpoint Detection & Response (EDR) platform designed specifically for small-to-medium enterprises (SMEs) in Cambodia. While commercial enterprise solutions (e.g., CrowdStrike, SentinelOne) are cost-prohibitive, complex to manage, and extract telemetry outside domestic borders, KhemStrix provides an affordable, sovereign cyber defense alternative.
 
-## 1. The Big Picture — How a Request Flows Through Your App
+Inspired by South Korea's AhnLab model—starting with domestic, underserved sectors and growing into a national defense standard—KhemStrix pairs a lightweight, dependency-free Go endpoint agent with a FastAPI/PostgreSQL ingestion engine and localized AI models. It is designed to be easily deployed by non-specialist IT administrators in a private office setting (Model 1) while remaining architecturally ready to scale into a centralized, sovereign threat sensor grid for national authorities such as MPTC and CamCERT (Model 2).
 
-```
-Client (agent / admin)
-        │
-        ▼
-   routers/*.py        ← receives HTTP request, validates input, calls logic
-        │
-        ▼
-   schemas/*.py         ← defines what valid input/output looks like (Pydantic)
-        │
-        ▼
-   db/models.py          ← Python classes mapped to real Postgres tables
-        │
-        ▼
-   db/database.py         ← manages the connection pool + session lifecycle
-        │
-        ▼
-   config.py               ← loads .env, builds the DB connection string
-        │
-        ▼
-   Postgres (erp database)  ← actual data lives here
-```
+**Architectural note (current revision):** the original design assumed periodic HTTP-based telemetry batching. Development has since moved to a **persistent WebSocket transport with a durable local outbox**, because continuous endpoint telemetry (process, file, auth, network events) cannot rely on the same request/response model used for agent registration and management. Section 6 documents this change and why it happened.
 
-Every layer has ONE job. Never let a layer do another layer's job (e.g. never
-put raw SQL string-building inside a router, never put request-validation logic
-inside `models.py`).
+## 2. Problem Statement
 
-For protected routes, there's one more layer sitting in front of the router:
+**The Cost and Expertise Barrier:** Enterprise EDR solutions require five-figure annual budgets in foreign currency and dedicated Security Operations Center (SOC) personnel. Cambodian SMEs (accounting firms, clinics, logistics hubs, educational institutions) lack both, leaving them completely unmonitored against ransomware and business email compromise (BEC).
 
-```
-Client
-  │
-  ▼
-Authorization: Bearer <token> header
-  │
-  ▼
-core/deps.py  → get_current_user_id()   ← verifies JWT signature + expiry
-  │
-  ▼
-routers/*.py                             ← only runs if the dependency succeeded
-```
+**Evolving Local Attack Vectors:** Local organizations run high risks on consumer and enterprise communication channels that standard tools rarely correlate simultaneously—namely business email (phishing/spoofing) and Telegram, which serves as the de facto operational and document-sharing backbone across Cambodian businesses and government agencies.
 
----
+**Regulatory and Sovereignty Gaps:** Emerging frameworks (MPTC Draft Cybersecurity Law, Draft Personal Data Protection Law, NBC-TCRMG) mandate auditable security monitoring, log retention, and strict data privacy. Small businesses currently have no accessible platform that satisfies compliance without exposing sensitive communications to overseas commercial clouds.
 
-## 2. What Each File Actually Does
+## 3. Deployment Models: On-Premise SME vs. Centralized Sovereign Cloud
 
-### `config.py`
-**Job:** Read `.env`, expose `settings.DATABASE_URL` and `settings.JWT_SECRET_KEY`.
-**Contains:** Zero logic. Just environment loading.
-**You touch this:** Almost never, after initial setup — maybe to add new
-settings as your app grows.
+KhemStrix is engineered from a single codebase to support two deployment realities without requiring architectural rewrites as the project scales.
 
-### `db/database.py`
-**Job:** Create the async engine (connection pool), the session factory, the
-shared `Base` class, and the `get_db()` dependency used by every router.
-**Contains:** Zero business logic. Just plumbing.
-**You touch this:** Almost never — maybe to tune pool settings (`pool_size`,
-`echo=False` for production) later.
+### Model 1: Autonomous On-Premise (Private SME Node)
 
-### `db/models.py`
-**Job:** Mirror your Postgres tables as Python classes (SQLAlchemy ORM).
-**Contains:** Column definitions, types, constraints, foreign keys,
-relationships. **No logic** — no validation, no business rules, no request
-handling.
-**You touch this:** Every time you add or change a table.
+Designed for individual Cambodian businesses—such as clinics, accounting firms, and local logistics offices—that require total data privacy and operate on strict hardware budgets. In this model, the entire backend (FastAPI, PostgreSQL, and the management dashboard) runs locally on an existing office workstation or mini-PC inside the company LAN. The Go agent reports directly to this local node with zero outbound cloud dependencies. To run reliably on low-spec hardware without crashing, event ingestion uses an in-process asynchronous queue rather than external brokers like Redis, and detection relies on lightweight, offline-trained models. No company telemetry, email metadata, or file hashes ever leave the physical office network.
 
-### `schemas/*.py`
-**Job:** Define what a valid API *request* and *response* look like —
-independent from the DB structure.
-**Contains:** Pydantic classes. No DB queries, no business logic — just shape
-+ validation rules.
-**You touch this:** Every time you add an endpoint, or change what an
-endpoint accepts/returns.
-**Why it's separate from `models.py`:** the DB table often has fields the
-client should never send (`agent_id`, `created_at`) or never see again
-(`api_key`, `password_hash`). Schemas let you control exactly what's
-exposed, per-endpoint.
+### Model 2: Sovereign Managed Cluster (Centralized Multi-Tenant Hub)
 
-### `routers/*.py`
-**Job:** This is where actual logic lives — the real "what happens when this
-endpoint is called."
-**Contains:**
-- Reading input (validated automatically via the schema type hint)
-- Querying/writing to the DB via `db.execute(select(...))`, `db.add(...)`,
-  `db.commit()`
-- Business rules (token expiry checks, credential checks, generating secrets)
-- Raising `HTTPException` for error cases
-- Returning data shaped by a response schema
+Designed for managed service providers, domestic telecom operators, or national cybersecurity authorities (such as MPTC and CamCERT) to deliver managed threat detection to micro-businesses that lack on-premise servers. In this model, the backend is hosted centrally in a domestic cloud facility. Hundreds of external organizations deploy the lightweight Go agent and point outbound over HTTPS/WSS to this central cluster. Strict multi-tenancy is enforced at the database layer via organization identifiers, ensuring complete data isolation between businesses while enabling the central platform to aggregate anonymized threat signatures into a collective national threat radar.
 
-**You touch this:** Every time you build a new feature/endpoint.
+### Unified Architecture Strategy
 
-### `core/security.py`
-**Job:** Password hashing and JWT create/verify — pure functions, no request
-handling, no DB access.
-**Contains:**
-- `hash_password()` / `verify_password()` — bcrypt via passlib
-- `create_access_token()` / `decode_access_token()` — JWT via python-jose,
-  signed with `settings.JWT_SECRET_KEY`, 24h expiry
-**You touch this:** Rarely — maybe to change token expiry duration or add
-a refresh-token flow later.
+To support both environments from day one, the team builds against the multi-tenant database schema and decoupled event pipeline immediately. For local SME use (Model 1), the system assigns all endpoints to a default organization identifier, operating as a self-contained node. When scaling to a centralized provider (Model 2), the identical server code simply registers additional organization records, eliminating the need to refactor database models or agent networking later.
 
-### `core/deps.py`
-**Job:** FastAPI dependencies that guard routes — currently just
-`get_current_user_id`.
-**Contains:** Reads the `Authorization: Bearer <token>` header, calls
-`decode_access_token()`, raises `401 not authenticated` on anything missing/
-invalid/expired, otherwise returns the `user_id` from the token.
-**You touch this:** To protect any new route, add
-`Depends(get_current_user_id)` as a parameter — no changes needed to this
-file itself unless you add new kinds of guards (e.g. role-based checks later).
+## 4. Telemetry Transport Architecture (WebSocket)
 
-### `detection/` and `response/`
-**Job (once you build into them):**
-- `detection/` — turns raw event data into a `score` / `verdict` (rules,
-  thresholds, eventually ML).
-- `response/` — takes a verdict and *does something* (isolate a host, kill a
-  process, alert an admin).
+### 4.1 Why the Architecture Moved to WebSocket
 
-These are kept separate from `routers/` so your "receive a request" logic
-never gets tangled up with your "decide if this is malicious" logic. A router
-should call into `detection/` or `response/`, not contain that logic itself.
+The original plan treated telemetry the same way as agent registration and management: discrete HTTP requests. That model works fine for infrequent operations (register agent, get status, request configuration), but endpoint security telemetry is fundamentally different — an endpoint can generate a continuous stream of process, file, login, and network events during normal operation.
 
-### `main.py`
-**Job:** Create the `FastAPI()` app, register (`include_router`) every
-router, nothing else.
-**Contains:** No business logic. Just wiring.
+A periodic batch-over-HTTP approach introduced three problems:
+- **Latency** — an important event generated right after a batch was sent would wait for the next cycle.
+- **Connection overhead** — repeated HTTP requests for a continuous stream is wasteful.
+- **Failure handling** — if the server was briefly unreachable, there was no defined behavior for what happens to the event. Silently discarding it was not acceptable, since telemetry's entire value is a complete record of what happened on the endpoint.
 
-## How Agent Authentication Works (`api_key`)
+This led to the current design: a **persistent WebSocket connection**, backed by **durable local storage**, so the agent never depends on the server being reachable at the exact moment an event occurs.
 
-Every agent needs a way to prove "it's still me" on every request after it
-first connects — without the server having to trust just an IP address or a
-hostname (both are easy to spoof). That's what `api_key` is for: a long,
-random, secret string that acts like a password, but for a machine instead
-of a human.
-
-### The problem it solves
-
-Your admin uses a **username + password** to log in as a human, once per
-session, and gets a temporary JWT back.
-
-An **agent** is different — it's an unattended process running on a
-customer's endpoint that needs to check in repeatedly (heartbeats, and later
-event uploads) with no human present to type a password. So instead of
-"login every time," an agent gets issued **one long-lived secret** at the
-moment it registers, and it sends that secret with every future request
-instead of logging in.
-
-### The full flow, end to end
+### 4.2 Architecture
 
 ```
-1. Admin (you) generates a one-time enrollment token
-      POST /admin/generate-token   (requires admin JWT — protected route)
-      → returns a random token, valid for 1 hour, single-use
-
-2. That token gets baked into the install script/binary
-   you hand to the customer (e.g. as a --token flag or embedded
-   in a downloaded install command)
-
-3. Customer downloads and runs the script on their machine
-      .\edr-agent.exe --server=http://<your-server-ip>:8000 --token=<the enrollment token>
-
-4. The agent calls the server to register itself
-      POST /agent/register
-      body: { hostname, os, enrollment_token }
-
-      Server checks (routers/agent.py -> register_agent):
-        - does this enrollment token exist?
-        - has it expired? (1 hour window)
-        - has it already been used?
-      If all checks pass:
-        - server generates a NEW random api_key (secrets.token_urlsafe(32))
-        - creates the Agent row, storing that api_key
-        - marks the enrollment token as used (so it can't be reused
-          to register a second agent)
-        - returns { agent_id, api_key } to the agent — ONE TIME ONLY
-
-5. The agent saves { agent_id, api_key } locally
-   (its own config file on the customer's machine — this is now the
-   agent's permanent credential, like a long-lived password)
-
-6. Every heartbeat after that, the agent sends its saved credentials
-   instead of re-registering
-      POST /agent/heartbeat
-      body: { agent_id, api_key }
-
-      Server checks (routers/agent.py -> heartbeat):
-        - does an agent with this agent_id exist?
-        - does its stored api_key match the one just sent?
-      If either check fails -> same generic 401 "invalid credentials"
-      (never reveals which part was wrong, so an attacker probing the
-      endpoint can't tell if an agent_id is real or not)
+Telemetry Collector
+        ↓
+   Event Model
+        ↓
+Durable Local Outbox (SQLite, WAL mode)
+        ↓
+ WebSocket Transport
+        ↓
+KhemStrix Server (WebSocket Manager + Event Processing)
+        ↓
+     PostgreSQL
 ```
 
-### Why the enrollment token and the api_key are two different things
+Collectors do not talk to the network directly. A process monitor produces a process event; a file monitor produces a file event. The shared pipeline (event model → outbox → WebSocket) handles persistence and delivery, so every telemetry source benefits from the same reliability guarantees without reimplementing them.
 
-| | `enrollment_token` | `api_key` |
+### 4.3 Reliability Mechanisms
+
+| Mechanism | Purpose |
+|---|---|
+| Persistent connection | Avoids per-event connection overhead; events stream continuously rather than in isolated request/response cycles |
+| Durable local outbox | Events are written locally *before* transmission is attempted, and are only removed once the server acknowledges receipt |
+| Reconnection | Agent detects a dropped connection and retries, with randomized jitter to avoid reconnect storms when many agents drop at once |
+| Reconciliation | On reconnect, the agent determines which queued events the server is missing and resends only those |
+| Duplicate protection | Each event carries a unique `event_id`; the server treats a repeat delivery of the same ID as a no-op rather than a new row, since at-least-once delivery implies duplicates are possible |
+| Heartbeat | ~10s interval ping/response used to distinguish a genuinely alive connection from one that appears open but isn't |
+
+### 4.4 Current Validation Status
+
+The mechanisms above have moved from "designed" to **tested against a real running backend and real agents**, including:
+
+- ✅ Durable local storage — events survive a server outage instead of being dropped
+- ✅ Reconnection — agent detects the outage and reconnects once the server returns, without manual intervention
+- ✅ Reconciliation — validated with both a single queued event and a batch (15 events queued during an outage, all delivered cleanly on reconnect)
+- ✅ Duplicate protection — verified directly in PostgreSQL; no repeated `event_id` rows despite retries across multiple test runs
+- ✅ Multi-agent isolation — validated with two independently registered agents (one Windows, one Linux/Kali) pushing events, including overlapping backlogs reconciling at the same time; all events landed under the correct `agent_id` with no cross-contamination
+
+**Still open, before the transport layer is considered production-ready:**
+- Full integration into the real agent runtime (current validation used a standalone test harness, not the production collectors)
+- Backlog behavior at much larger scale (the design target is on the order of 100,000 queued events; only tens of events have been tested so far) and **chunked reconciliation** to avoid resending a huge backlog as one operation
+- Outbox size limits, disk usage behavior, and retention policy for long outages (hours to days)
+- Heartbeat/timeout behavior under degraded (not just cleanly killed) network conditions
+
+## 5. Event Contract
+
+Before telemetry collectors are built out, the project needs one consistent event structure shared across the outbox, WebSocket messages, backend validation, database storage, and future detection rules. Earlier prototypes used inconsistent field naming (`event_type`/`raw_data` vs. `class_uid`/`category_uid`); this needs to be finalized to avoid every collector producing a slightly different shape.
+
+Proposed common envelope:
+
+```json
+{
+  "event_id": "unique-event-id",
+  "agent_id": "agent-id",
+  "event_type": "process_start",
+  "timestamp": "2026-09-15T10:30:00Z",
+  "data": {
+    "process": "powershell.exe",
+    "pid": 4820,
+    "parent_pid": 3210,
+    "command_line": "..."
+  },
+  "schema_version": 1
+}
+```
+
+Different telemetry sources share the outer envelope while storing source-specific detail under `data`.
+
+## 6. Phased Implementation Roadmap
+
+```
+┌───────────┐     ┌───────────┐     ┌───────────┐     ┌───────────┐
+│  Phase 1  │ ──► │  Phase 2  │ ──► │  Phase 3  │ ──► │  Phase 4  │
+│ Server &  │     │ WebSocket │     │ Endpoint  │     │  Rule-    │
+│ Agent Reg │     │ Transport │     │ Telemetry │     │  Based    │
+│           │     │ (current) │     │           │     │ Detection │
+└───────────┘     └───────────┘     └───────────┘     └─────┬─────┘
+                                                            │
+┌───────────┐     ┌───────────┐     ┌───────────┐           │
+│  Phase 7  │ ◄── │  Phase 6  │ ◄── │  Phase 5  │ ◄─────────┘
+│ Active    │     │ Incident  │     │ Email /   │
+│ Response  │     │ Reporting │     │ Telegram/ │
+│           │     │           │     │ AI / ML   │
+└───────────┘     └───────────┘     └───────────┘
+```
+
+The roadmap has been reordered from the original plan. Email and Telegram telemetry, AI/ML detection, and active response all remain part of the product, but they are pushed later because none of them are useful without a reliable telemetry foundation underneath them. A detection rule that correlates process and network events cannot exist if those events aren't being collected reliably in the first place.
+
+### Phase 1: Server Infrastructure, Agent Registration & Lifecycle Validation
+
+**Objective:** Establish the foundational client-server communication, authentication, database schemas, and background execution loops.
+
+**Key Deliverables:**
+- FastAPI backend with PostgreSQL persistence and full UTC timezone alignment.
+- Multi-tenancy anchor (`organizations`/`tenant_id`) with default tenant scoping.
+- Go binary with static compilation for Windows (`.exe`) and Linux (cross-compiled via `GOOS=linux`).
+- One-line chained installer for PowerShell and Bash.
+- Background service registration: Linux systemd unit and Windows Service execution.
+- Dynamic network metadata sync (`ip_address` and `mac_address`) on active heartbeats (`POST /agent/heartbeat`).
+- Web dashboard for fleet visibility, agent revocation, reactivation, and hard deletion.
+
+**Current Status:** Complete. Validated with two independently registered agents (Windows + Linux) both active and reporting.
+
+### Phase 2: WebSocket Transport & Durable Telemetry Pipeline *(current phase)*
+
+**Objective:** Establish a reliable, persistent, failure-tolerant communication path between agent and server, capable of carrying a continuous stream of security events without loss — the prerequisite for all telemetry collection that follows.
+
+**Key Deliverables:**
+- Persistent WebSocket connection between agent and backend, with authentication.
+- Durable local outbox (SQLite, WAL mode) so events survive disconnects.
+- Reconnection with jittered backoff to avoid reconnect storms across a fleet.
+- Reconciliation of queued events on reconnect.
+- Idempotent, duplicate-safe event delivery via unique `event_id`.
+- Heartbeat-based connection health detection.
+- Finalized, versioned event contract shared across collector → outbox → transport → backend → database.
+
+**Current Status:** Core mechanisms implemented and validated against a live backend (see Section 4.4). Real-agent runtime integration, large-scale backlog handling, and chunked reconciliation remain open.
+
+### Phase 3: Endpoint Core System Telemetry
+
+**Objective:** Expand the Go agent into a true system monitor capturing host-level activity, using the Phase 2 pipeline.
+
+**Key Deliverables:**
+- **Process Monitoring:** process spawn events, parent-child relationships (e.g., `winword.exe` spawning `powershell.exe`), and command-line execution flags.
+- **File Integrity Monitoring (FIM):** file creation, modification, deletion, and rename events across sensitive directories (`/etc`, `System32`, user Desktop/Downloads), starting with a curated directory set rather than the whole filesystem.
+- **Authentication & Login Auditing:** interactive and remote login attempts, failed logon spikes, privilege escalations, and SSH/RDP session states.
+- **Network Socket Logging:** active outbound socket connections (remote IP, target port, binary binding) to detect Command-and-Control (C2) callbacks.
+
+The goal at this stage is accurate collection, not classification — answering "what happened on the endpoint," not yet "was it suspicious."
+
+### Phase 4: Rule-Based Detection
+
+**Objective:** Build deterministic detection rules on top of validated telemetry — e.g., suspicious process relationships (Office app → PowerShell), brute-force login patterns, suspicious file-then-execute sequences, and unexpected outbound network activity.
+
+### Phase 5: Email, Telegram, and AI/ML Detection
+
+**Objective:** Extend telemetry coverage to email (Gmail/IMAP phishing detection) and Telegram (Cambodia's dominant workplace communication channel), and layer AI/ML analysis — NLP-based social engineering classification, behavioral anomaly detection, and MITRE ATT&CK tagging — on top of the by-then-mature telemetry and detection foundation.
+
+### Phase 6: Automated Incident Reporting
+
+**Objective:** Provide actionable, plain-language intelligence tailored for non-specialist SME administrators and regulatory compliance audits — end-to-end attack timelines, remediation playbooks, and audit-ready export aligned with MPTC/NBC guidelines.
+
+### Phase 7: Active Response & Automated Containment
+
+**Objective:** Move from passive detection to active threat neutralization — remote process termination, endpoint network isolation, artifact quarantine, and a human-in-the-loop confirmation flow on the dashboard before any automated containment action executes.
+
+## 7. Team
+
+| Name | Focus Area | Role |
 |---|---|---|
-| Purpose | One-time proof "an admin authorized this machine to join" | Ongoing proof "this is the same agent that registered before" |
-| Lifespan | 1 hour, single-use, then dead | Lives as long as the agent is enrolled |
-| Where it's used | Only once, in `POST /agent/register` | Every single heartbeat (and future event uploads) |
-| Who generates it | The **server**, on admin request | The **server**, automatically, at registration time |
-
-Splitting these apart means a leaked/expired enrollment token is useless
-after an hour and can't be reused to enroll a second (rogue) device, while
-the `api_key` that actually matters long-term is never sent over the network
-until the one moment it's created.
-
-### How `api_key` is generated (the actual code)
-
-`routers/agent.py`, inside `register_agent()`:
-```python
-new_api_key = secrets.token_urlsafe(32)
-```
-`secrets.token_urlsafe(32)` uses Python's cryptographically secure random
-number generator (not the regular `random` module, which is predictable and
-unsafe for this) to produce a 32-byte random value, encoded as a URL-safe
-base64 string. This is the same function already used to generate
-enrollment tokens (`secrets.token_urlsafe(32)` in `admin.py`) — consistent
-approach for anything that needs to be an unguessable secret.
-
-This key is:
-- **Never chosen or influenced by the client** — always fully random,
-  generated server-side, so there's no risk of a weak/predictable key
-- **Shown to the agent exactly once**, in the `POST /agent/register`
-  response (`AgentRegisterResponse` schema — the *only* schema that includes
-  `api_key`)
-- **Stored in plaintext in Postgres** (`agents.api_key`) — unlike
-  `users.password_hash`, this is intentional: heartbeat verification does a
-  direct string comparison (`agent.api_key != payload.api_key`), not a
-  hash-and-compare like login does. See the architecture doc's hardening
-  notes if you want to upgrade this to a hashed comparison later.
-- **Excluded from every other response** — `GET /agents` uses `AgentResponse`,
-  which has no `api_key` field at all, so it's never visible to anyone
-  browsing the agent list, admin or not.
-
-### If an agent's `api_key` is ever compromised
-
-There's currently no "revoke and reissue" endpoint — if a customer's machine
-is compromised and its `api_key` leaks, the current options are:
-1. Manually delete/deactivate that row in `agents` via Postgres, and
-2. Have the agent re-run the registration flow with a fresh enrollment
-   token to get a new `api_key`
-
-A dedicated `POST /admin/agents/{agent_id}/revoke` endpoint (protected,
-admin-only) is a reasonable future addition once you're past the prototype
-stage — worth noting in the roadmap alongside the other pre-production
-hardening items.
-
----
-
-## 3. The Checklist: Adding a New Table
-
-Every time you add a table, walk through these steps **in this order**:
-
-### Step 1 — Create the table in Postgres (source of truth)
-```sql
-CREATE TABLE alerts (
-  alert_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_id uuid NOT NULL REFERENCES agents(agent_id),
-  severity text NOT NULL,
-  message text NOT NULL,
-  created_at timestamp NOT NULL DEFAULT now(),
-  resolved boolean NOT NULL DEFAULT false
-);
-```
-Verify with `\dt` and `\d alerts` in psql.
-
-### Step 2 — Add the model in `db/models.py`
-```python
-class Alert(Base):
-    __tablename__ = "alerts"
-
-    alert_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
-    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.agent_id"), nullable=False)
-    severity = Column(Text, nullable=False)
-    message = Column(Text, nullable=False)
-    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
-    resolved = Column(Boolean, nullable=False, default=False)
-
-    agent = relationship("Agent", back_populates="alerts")
-```
-If you add a `relationship(...)`, remember to add the reverse side on the
-related model too (e.g. `alerts = relationship("Alert", back_populates="agent")`
-on `Agent`). **Gotcha you already hit once:** if you comment out or remove a
-model class, also comment out/remove any `relationship("ThatClass", ...)`
-pointing at it elsewhere — SQLAlchemy fails at mapper-configuration time with
-a `KeyError`/`InvalidRequestError` if a relationship references a class name
-that isn't registered.
-
-### Step 3 — Add schemas in `schemas/alert.py`
-Ask: what should a client be allowed to **send**, and what should they be
-allowed to **see back**? These are often NOT identical to the full model.
-```python
-class AlertCreate(BaseModel):
-    agent_id: UUID
-    severity: str
-    message: str
-
-class AlertResponse(BaseModel):
-    alert_id: UUID
-    agent_id: UUID
-    severity: str
-    message: str
-    created_at: datetime
-    resolved: bool
-
-    class Config:
-        from_attributes = True
-```
-
-### Step 4 — Build the router in `routers/alerts.py`
-This is where the actual behavior lives:
-```python
-@router.post("/alerts", response_model=AlertResponse)
-async def create_alert(payload: AlertCreate, db: AsyncSession = Depends(get_db)):
-    new_alert = Alert(**payload.model_dump())
-    db.add(new_alert)
-    await db.commit()
-    await db.refresh(new_alert)
-    return new_alert
-```
-
-If the route should be admin-only, add the auth dependency too:
-```python
-from core.deps import get_current_user_id
-
-@router.post("/alerts", response_model=AlertResponse)
-async def create_alert(
-    payload: AlertCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user_id: str = Depends(get_current_user_id),
-):
-    ...
-```
-
-### Step 5 — Wire the router into `main.py`
-```python
-from routers import alerts
-app.include_router(alerts.router, tags=["alerts"])
-```
-
-### Step 6 — Test via `/docs`
-Run the server, open `http://localhost:8000/docs`, and manually exercise the
-new endpoint(s) before building anything on top of them. For protected
-routes, test both without and with a valid `Authorization: Bearer <token>`
-header — confirm you get `401 not authenticated` in the first case.
-
----
-
-## 4. The Checklist: Modifying an Existing Table
-
-Say you want to add `ip_address` to `agents`:
-
-1. **Postgres:** `ALTER TABLE agents ADD COLUMN ip_address text;`
-2. **`db/models.py`:** add `ip_address = Column(Text)` to the `Agent` class
-3. **`schemas/agent.py`:** add `ip_address: Optional[str] = None` to
-   `AgentResponse` (and to `AgentCreate` only if clients should be allowed
-   to set it themselves)
-4. **`routers/agent.py`:** update logic if the new field needs to be set/used
-   somewhere (e.g. captured during registration)
-
-**Order matters:** always change Postgres first, then work back up through
-the layers. SQLAlchemy does not auto-sync with the database — you keep
-`models.py` in sync by hand (or via Alembic, see below).
-
----
-
-## 5. Rules of Thumb As You Scale
-
-- **`models.py` = structure only.** If you're tempted to write an `if`
-  statement in there, it belongs in a router or a service module instead.
-- **`schemas/` = contract with the outside world.** Never expose secrets
-  (`api_key`, `password_hash`) in a general-purpose response schema — only
-  in a dedicated one-time response schema (like `AgentRegisterResponse`),
-  or never at all (there is no `UserResponse` that includes `password_hash`,
-  and there shouldn't be).
-- **Routers should stay thin.** If a router function starts getting long
-  (validating, scoring, deciding a response action, sending alerts...),
-  pull the scoring/response logic out into `detection/` or `response/` and
-  have the router just call those functions.
-- **Same error for different failure reasons, when it matters for security.**
-  E.g. `heartbeat` returns the same `401 invalid credentials` whether the
-  `agent_id` doesn't exist or the `api_key` is wrong — this prevents an
-  attacker from enumerating valid agent IDs. `POST /auth/login` follows the
-  same rule: wrong username and wrong password both return the same
-  `401 invalid credentials`.
-- **Never build raw SQL strings with f-strings/concatenation.** Always use
-  SQLAlchemy's `select(...)`/`.where(...)` or parameterized queries (`$1`,
-  `$2` with asyncpg). This is what protects you from SQL injection by
-  default — don't work around it.
-- **One-time secrets get their own response schema.** Anything like
-  `api_key` or a freshly generated token should have a dedicated `*Response`
-  schema used only at creation time, separate from the general "list/get"
-  response schema.
-- **A valid JWT proves "who you were when the token was issued," not
-  "confirm this sensitive change right now."** That's why
-  `PUT /auth/change-password` still requires the current password even
-  though the caller already passed the JWT check — a stolen/leaked token
-  shouldn't be enough on its own to lock the real owner out of their account.
-- **Postgres columns here are `timestamp without time zone`.** Always strip
-  `tzinfo` (`.replace(tzinfo=None)`) before storing a
-  `datetime.now(timezone.utc)` value, but return the tz-aware version in API
-  responses. JWT expiry (`exp` claim) doesn't hit this issue — `python-jose`
-  handles the conversion internally.
-
----
-
-## 6. When Your Schema Starts Changing Often: Alembic
-
-Right now you're manually keeping Postgres and `models.py` in sync by hand.
-That's fine at this stage, but once you have several tables and are changing
-things frequently (especially with teammates, or once you deploy), consider
-introducing **Alembic** — a migration tool for SQLAlchemy that:
-
-- Tracks every schema change as a versioned Python script
-- Lets you upgrade/downgrade the database automatically (`alembic upgrade head`)
-- Removes the need to manually remember and re-type `ALTER TABLE` statements
-- Keeps a history of every schema change, which is invaluable once this
-  isn't just a single local database anymore
-
-You don't need it yet — but when manual syncing starts feeling error-prone
-or you're setting up a second environment (e.g. deploying to a real server),
-that's the signal to introduce it.
-
----
-
-## 7. Current Project Snapshot (as of this guide)
-
-**Tables in Postgres:** `enrollment_tokens`, `agents`, `users`.
-`events` is defined in `models.py` but currently commented out (along with
-the matching `Agent.events` relationship) — not yet created in Postgres.
-Uncomment both sides and create the table when you're ready to build event
-ingestion.
-
-**New folder: `core/`**
-- `core/security.py` — password hashing (bcrypt via passlib) and JWT
-  create/verify helpers (python-jose, `HS256`, 24h expiry, signed with
-  `settings.JWT_SECRET_KEY`). Pure functions — no DB access, no request
-  handling.
-- `core/deps.py` — `get_current_user_id`, a FastAPI dependency that reads
-  the `Authorization: Bearer <token>` header, verifies it, and either
-  returns the `user_id` or raises `401 not authenticated`. Add this as a
-  `Depends()` on any route that should require login.
-
-**New schema file: `schemas/auth.py`**
-- `LoginRequest` — `username`, `password`
-- `TokenResponse` — `access_token`, `token_type` (defaults to `"bearer"`)
-- `ChangePasswordRequest` — `current_password`, `new_password`
-
-**New router: `routers/auth.py`, mounted at `/auth`**
-- `POST /auth/login` — looks up the user, verifies the password hash,
-  returns a JWT on success. Same generic `401 invalid credentials` for
-  "user doesn't exist" and "wrong password."
-- `PUT /auth/change-password` — protected route (requires a valid JWT).
-  Also requires the caller to supply their *current* password before
-  setting a new one, even though they're already authenticated — this
-  prevents a stolen token alone from being enough to lock out the real
-  admin.
-
-**Bootstrapping the first admin: `create_admin.py`**
-A one-time CLI script (run manually, not exposed via any endpoint) that
-prompts for a username/password and inserts the first row into `users`,
-with the password hashed via `core/security.hash_password()`. There is no
-public signup route — this is intentional. This script is a **development/
-testing tool**, not a production onboarding flow; see the note at the end of
-this section for what a real deployment would need instead.
-
-**Endpoints built:**
-- `POST /auth/login` — admin login, returns JWT
-- `PUT /auth/change-password` — admin changes their own password (protected)
-- `POST /admin/generate-token` — admin creates a one-time enrollment token
-  (**protected** — requires `Authorization: Bearer <token>`)
-- `POST /agent/register` — new agent registers using a valid enrollment token
-- `POST /agent/heartbeat` — registered agent proves it's alive
-- `GET /agents` — list all agents, excludes `api_key`
-  (**not yet protected** — see "Next natural additions" below)
-
-**How to test the full auth flow via `/docs`:**
-1. `POST /admin/generate-token` with no `Authorization` header →
-   expect `401 {"detail": "not authenticated"}`
-2. `POST /auth/login` with your admin username/password →
-   copy the `access_token` from the response
-3. Call `POST /admin/generate-token` again, this time manually adding header
-   `Authorization: Bearer <token>` → expect a `200` with the enrollment token
-   (note: since this dependency is a plain `Header(...)` check rather than
-   FastAPI's `OAuth2PasswordBearer` scheme, the Swagger "Authorize" lock icon
-   in `/docs` won't auto-attach the header — set it manually per-request, or
-   test with curl/Postman)
-
-**Next natural additions**, in likely order:
-1. Protect `GET /agents` the same way `/admin/generate-token` is protected
-   — currently it's the one remaining open route that probably shouldn't be
-2. `events` table + `routers/events.py` — agent event ingestion
-3. `detection/` scoring logic — turn raw events into `score` + `verdict`
-4. `response/` actions — act on verdicts (isolate host, alert, etc.)
-5. Alembic, once schema changes become frequent
-6. Admin dashboard frontend (`dashboard/`, currently just planned) — login
-   page, protected routes on the frontend side, token storage
-   (localStorage is fine for a local-network student prototype; note it as
-   a pre-production hardening item alongside HTTPS and multi-tenancy)
-7. Production-grade admin bootstrapping — `create_admin.py` is a dev/testing
-   tool, not something you'd hand to a real SME customer. Before any real
-   deployment, replace or supplement it with one of: (a) auto-generate a
-   random admin password on first startup and print it once to the console/
-   logs, (b) force a password change on first login via a
-   `must_change_password` flag, or (c) a first-run setup wizard in the
-   dashboard that prompts the user to choose their own admin credentials.
+| Rong Sovannorth | Cybersecurity | Lead, Dev, Assists Research, AI and ML |
+| Roth Monyreach | Cybersecurity | Security Research, Assists Dev |
+| Kea Sophanh | AI and ML | AI and ML, Assists Research |

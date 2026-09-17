@@ -98,12 +98,18 @@ func Run(ctx context.Context, flags config.Flags) error {
 
 	} else {
 		// --- Existing Config Path ---
+		// A saved config.json always wins over a --server flag here. The
+		// background service is normally launched with no CLI arguments at
+		// all (see main.go), so if flags.Server is non-empty and disagrees
+		// with the saved config, that's almost certainly an accidental or
+		// stale flag from manual/debug invocation — not an intentional
+		// re-point of a running agent. Silently honoring it would let a
+		// single mistyped flag redirect a production agent's event stream
+		// to the wrong server. We only log the mismatch and keep cfg.Server
+		// as-is; anyone who genuinely wants to re-point an agent should
+		// edit config.json directly (or re-run registration).
 		if flags.Server != "" && flags.Server != cfg.Server {
-			log.Printf("server address override detected: switching from %s to %s", cfg.Server, flags.Server)
-			cfg.Server = flags.Server
-			if err := config.Save(cfg); err != nil {
-				log.Printf("warning: failed to save updated server URL to config: %v", err)
-			}
+			log.Printf("ignoring --server=%s: saved config.json already targets %s and takes precedence", flags.Server, cfg.Server)
 		}
 	}
 
@@ -130,6 +136,10 @@ func Run(ctx context.Context, flags config.Flags) error {
 			} else {
 				log.Printf("wsclient: starting, targeting %s", wsURL)
 				go wsc.Run(ctx)
+				go func() {
+					<-ctx.Done()
+					_ = st.Close()
+				}()
 				// Note: st is intentionally not closed here — it's owned by
 				// wsc for the remaining lifetime of this run, and needs to
 				// stay open until ctx is cancelled and wsc.Run returns.

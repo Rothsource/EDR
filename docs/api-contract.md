@@ -354,6 +354,117 @@ at `static/binaries/khemstrixAgent`).
 
 ---
 
+## WebSocket Route — `routers/ws.py` (no shared prefix)
+
+### `WS /agent/ws`
+**Protected:** No standard header auth — authentication happens via the
+first message sent on the socket, not a header or query param
+**Called by:** The Go agent binary's `internal/wsclient` package, held
+open persistently for the agent's entire runtime
+
+This is the real-time event delivery path, replacing the originally
+planned `POST /agent/events` batching design (see "Not Yet Implemented"
+below for why that plan changed). Full design rationale lives in
+`report.md` §3; this section documents only the wire contract.
+
+**Connection lifecycle:**
+
+1. **Client dials** `ws://<server>/agent/ws` (or `wss://` in production).
+   The server accepts the upgrade unconditionally at this point — no
+   credentials checked yet.
+
+2. **First message must be `auth`** — anything else, or silence for more
+   than 10 seconds, closes the connection with code `4001`:
+   ```json
+   { "type": "auth", "agent_id": "uuid", "api_key": "string" }
+   ```
+   Checked against the same three conditions as `POST /agent/heartbeat`
+   (agent exists, `api_key` matches, `status == "active"`). **There is no
+   explicit success reply** — silence and the connection staying open
+   *is* the success signal. On failure:
+   ```json
+   { "type": "error", "detail": "invalid credentials" }
+   ```
+   followed by a close with code `4401`.
+
+3. **Reconciliation runs immediately after successful auth**, initiated
+   by the client:
+   ```json
+   { "type": "reconcile_request", "event_ids": ["uuid", "uuid", ...] }
+   ```
+   Server replies with whichever of those IDs it already has on file:
+   ```json
+   { "type": "reconcile_response", "known_event_ids": ["uuid", ...] }
+   ```
+   This lets an agent reconnecting after any length of outage catch up
+   in one round trip rather than blindly resending its entire local
+   backlog.
+
+4. **Steady-state event delivery**, client → server:
+   ```json
+   {
+     "type": "event",
+     "event_id": "uuid",
+     "time": "2026-09-15T08:19:20Z",
+     "class_uid": 1001,
+     "category_uid": 1,
+     "activity_id": 1,
+     "type_uid": 100101,
+     "severity_id": 1,
+     "hostname": "string | null",
+     "username": "string | null",
+     "metadata": { "...": "..." } ,
+     "data": { "...": "..." }
+   }
+   ```
+   `agent_id` and `tenant_id` are **never** read from this payload — both
+   are stamped server-side from the already-authenticated connection,
+   same rule as every other insert path in this project. Server inserts
+   with `ON CONFLICT (event_id) DO NOTHING` (idempotent — a duplicate
+   send, whether from a client retry or a reconciliation resend, is a
+   harmless no-op) and replies:
+   ```json
+   { "type": "ack", "event_id": "uuid" }
+   ```
+   **Known gotcha, fixed during testing:** `time` must not carry timezone
+   info by the time it reaches the insert — the column is `timestamp
+   without time zone`, and a tz-aware value raises a driver-level error.
+   The route strips `tzinfo` before insert if present.
+
+5. **Heartbeat, server-initiated:** roughly every 10 seconds:
+   ```json
+   { "type": "ping" }
+   ```
+   Client must reply:
+   ```json
+   { "type": "pong" }
+   ```
+   Missing 2–3 consecutive pongs (~20–30s) → server evicts the connection
+   with close code `4408`.
+
+**Close codes summary:**
+
+| Code | Meaning |
+|---|---|
+| `4001` | No valid first message within 10s, or first message wasn't `type: auth` |
+| `4401` | Auth message received but credentials invalid/revoked |
+| `4408` | Heartbeat timeout — client stopped responding to pings |
+| `1006` | Abnormal closure — typically an unhandled server-side exception; check server logs, not a designed-for close code |
+
+**Agent-side behavior on any disconnect** (regardless of close code):
+events already durably written to the agent's local SQLite outbox are
+untouched — nothing is lost. The client reconnects automatically using
+exponential backoff with random jitter (so a server restart doesn't
+cause every connected agent to reconnect in the same instant), then
+repeats steps 2–3 above before resuming normal delivery.
+
+**This route has been tested end-to-end**, including a deliberate full
+server outage with events queued mid-outage — see `report.md` §5 for the
+verified test results. `report.md` §8 has step-by-step instructions for
+reproducing these tests from a fresh checkout.
+
+---
+
 ## Utility Route
 
 ### `GET /`
@@ -383,16 +494,45 @@ confirms the server process is up.
 | DELETE | `/admin/agents/{agent_id}` | Yes | ✅ |
 | GET | `/download/agent/windows` | No | N/A — install-command target |
 | GET | `/download/agent/linux` | No | N/A — install-command target |
+| WS | `/agent/ws` | No (auth via first message) | N/A — agent-only |
 | GET | `/` | No | N/A |
 
 ---
 
 ## Not Yet Implemented (planned, per roadmap)
 
-- `POST /agent/events` and `GET /events` — generic event ingestion.
-  `db/models.py` has `Event` fully written but commented out; no router
-  file exists yet. See `developer.md` §7 for the exact steps to bring
-  this online. **Note for whenever this is built:** it should apply the
-  same `agent_id` + `api_key` + `status == "active"` check that
-  `/agent/heartbeat` already does — otherwise a revoked agent could still
-  push event data through even though its heartbeats correctly fail.
+**A note on what changed here:** this section previously described
+`POST /agent/events` and `GET /events` as a REST batching design (agent
+buffers events, flushes a batch every ~20s). **That plan has been
+superseded** by the persistent WebSocket route (`WS /agent/ws`,
+documented above), which is now built and tested. It exists specifically
+because REST batching was too slow for urgent detections — see
+`report.md` §3–4 for the full reasoning. The items below are what's
+*still* actually missing, not a restatement of the old plan.
+
+- **`GET /events`** — a query/read endpoint for the dashboard to actually
+  browse stored events. `events` rows exist and are being written to
+  correctly via `WS /agent/ws`, but nothing yet exposes them back out to
+  the dashboard. This is now the real gap — not the ingestion path, which
+  works, but the retrieval path, which doesn't exist.
+- **The Go agent's WebSocket client is not yet wired into the real agent
+  binary.** `internal/wsclient` exists and has been tested directly, but
+  only via standalone throwaway test programs (`cmd/testpush`,
+  `cmd/testreconnect`) — it has not yet been started from the agent's
+  actual `internal/core/run.go` main loop. See `report.md` §6–7.
+- **No detection module produces real events yet.** Every event used in
+  testing so far was synthetic, generated by a throwaway test harness —
+  not by an actual email/process/network/file monitoring module. The
+  first real source is planned to be email phishing detection
+  (`agent/internal/modules/email/`) — see `report.md` §7 Step 6.
+- **Event contract mismatch, still unresolved:** an earlier design
+  document described a different event shape (`event_type` / `raw_data`
+  / `extracted_features`) than what's actually implemented in
+  `schemas/ws.py` and used above (classification-code fields plus a
+  generic `data` object). These need to be reconciled onto one agreed
+  shape before more detection modules get built — see `report.md` §6
+  Step 5.
+- **When `GET /events` is eventually built,** it should apply the same
+  tenant-scoping caution already flagged for `GET /agents` in
+  `architecture.md` §3.5 — filter by the authenticated admin's
+  `tenant_id`, not return every organization's events unconditionally.

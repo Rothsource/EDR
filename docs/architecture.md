@@ -1,599 +1,720 @@
-# Architecture
+# EDR Project — Architecture & Scaling Guide
 
-This document explains how the pieces of the EDR project fit together: the
-Go agent, the FastAPI server, the React dashboard, and Postgres — and the
-authentication model that connects all three.
-
----
-
-## 1. System Overview
-
-```
-┌─────────────┐        HTTP/JSON        ┌──────────────────┐
-│  Go Agent   │ ─────────────────────▶  │  FastAPI Server   │
-│ (endpoint)  │ ◀───────────────────── │  (server/app/)      │
-└─────────────┘                         └──────────┬─────────┘
-                                                     │
-┌─────────────┐        HTTP/JSON                   │  SQLAlchemy (async)
-│  Dashboard  │ ─────────────────────▶ ─────────────┤
-│  (React)    │ ◀─────────────────────              │
-└─────────────┘                                     ▼
-                                            ┌──────────────────┐
-                                            │    PostgreSQL      │
-                                            │  (erp / edr_project)│
-                                            └──────────────────┘
-```
-
-Three independent clients talk to one FastAPI server:
-
-- **The Go agent (KhemStrix agent)** — runs on a monitored endpoint.
-  Registers once with an enrollment token, then heartbeats periodically
-  using a permanent `api_key`. Now a real, compiled, tested binary
-  (`agent/`, module `khemstrix-agent`) rather than a design-only plan.
-- **The React dashboard** — runs in an admin's browser. Logs in as a human
-  user (`users` table) and gets a JWT, used for every subsequent request.
-- **PostgreSQL** — the single source of truth for all data. Both the agent
-  and dashboard flows ultimately read/write the same tables.
-
-A fourth, lighter-weight flow now exists too — the **binary distribution
-path** (see section 5) — where a fresh, unregistered machine downloads the
-agent binary directly from the server before it has any credentials at
-all.
+This is your reference doc for understanding what each file does, and the exact
+checklist to follow every time you add a new table or feature.
 
 ---
 
-## 2. Request Flow Through the Server
-
-Every request into the FastAPI server passes through the same layered
-pipeline, regardless of whether it came from the Go agent or the dashboard:
+## 1. The Big Picture — How a Request Flows Through Your App
 
 ```
-Client (agent / dashboard / fresh install target)
+Client (agent / admin)
         │
         ▼
-[ Optional ] Authorization: Bearer <token> header
+   routers/*.py        ← receives HTTP request, validates input, calls logic
         │
         ▼
-core/deps.py → get_current_user_id()   ← verifies JWT signature + expiry
-        │        (only on protected routes)
-        ▼
-routers/*.py        ← receives HTTP request, validates input, runs logic
+   schemas/*.py         ← defines what valid input/output looks like (Pydantic)
         │
         ▼
-schemas/*.py         ← defines what valid input/output looks like (Pydantic)
+   db/models.py          ← Python classes mapped to real Postgres tables
         │
         ▼
-db/models.py          ← Python classes mapped to real Postgres tables
+   db/database.py         ← manages the connection pool + session lifecycle
         │
         ▼
-db/database.py         ← manages the connection pool + session lifecycle
+   config.py               ← loads .env, builds the DB connection string
         │
         ▼
-config.py               ← loads .env, builds the DB connection string
-        │
-        ▼
-PostgreSQL
+   Postgres (erp database)  ← actual data lives here
 ```
 
-Every layer has ONE job. A router never builds raw SQL strings; a model
-never contains business logic; a schema never touches the database
-directly. This separation is what makes it possible to add new features
-without breaking existing ones — see `developer.md` for the concrete
-step-by-step process.
+Every layer has ONE job. Never let a layer do another layer's job (e.g. never
+put raw SQL string-building inside a router, never put request-validation logic
+inside `models.py`). This separation is what keeps the codebase debuggable as
+it grows — when something breaks, you know which file to open based on *what
+kind* of thing broke (a bad value from a client → schemas; wrong data in the
+DB → models/router logic; a connection problem → database.py/config.py).
 
-**Lesson learned this phase:** this layering is only as strong as its
-weakest link — the `ip_address` column existed in Postgres, in
-`schemas/agent.py`, and was referenced in `routers/agent.py`, but was
-missing from `db/models.py`. SQLAlchemy silently dropped the value on
-every insert, with no error anywhere in the stack. `/docs` still showed
-the field being "accepted," because Pydantic validates and echoes
-input/output independently of whether the ORM layer actually persists it.
-**The only way this was caught was querying Postgres directly.** Treat a
-direct `SELECT` against the real table as the actual proof a new field
-works — not a clean-looking `/docs` response.
+For protected routes, there's one more layer sitting in front of the router:
 
-**Same lesson, opposite failure mode, hit again this phase:** when
-`tenant_id` was added to `agents` and `enrollment_tokens` as `NOT NULL` in
-Postgres before `db/models.py` and the router insert calls were updated to
-match, the failure mode flipped from "silently dropped" to "hard crash" —
-every `POST /agent/register` and `POST /admin/generate-token` call raised
-an `IntegrityError` until all three layers were brought back in sync. Both
-directions point at the same rule: **a schema change isn't done until
-Postgres, `models.py`, `schemas/*.py`, and the router insert/update calls
-all agree** — checking only one or two of them can look fine and still be
-broken.
+```
+Client
+  │
+  ▼
+Authorization: Bearer <token> header
+  │
+  ▼
+core/deps.py  → get_current_user_id()   ← verifies JWT signature + expiry
+  │
+  ▼
+routers/*.py                             ← only runs if the dependency succeeded
+```
+
+### 1.1 A Second Flow: Telemetry Events (WebSocket)
+
+Admin and agent-management traffic (login, registration, heartbeat) follows
+the HTTP request/response flow above. Telemetry events follow a **parallel,
+persistent-connection flow**, because they're a continuous stream rather than
+discrete operations:
+
+```
+Agent (Go)
+   │
+   │  1. Event generated by a collector
+   ▼
+Local durable outbox (SQLite, WAL mode)   ← event written here BEFORE send is attempted
+   │
+   │  2. Attempt delivery over the open WebSocket
+   ▼
+WebSocket connection (persistent, authenticated once at connect time)
+   │
+   ▼
+Backend WebSocket manager                  ← lives alongside routers/*.py,
+   │                                          but is not a normal HTTP router
+   │  3. Server validates + stores the event
+   ▼
+Postgres `events` table
+   │
+   │  4. Server sends an acknowledgement back over the same connection
+   ▼
+Agent outbox                                ← event is only deleted here,
+                                               after ack is received
+```
+
+The two flows share the same database and the same agent identity/auth model
+(`agent_id` + `api_key`), but the transport mechanics are different enough
+that it's worth keeping them mentally separate: HTTP routers are stateless
+per-request; the WebSocket manager holds a live connection per agent and has
+to track connection state, not just handle one request and return.
 
 ---
 
-## 3. Authentication Model — Two Different Kinds of "Identity"
+## 2. What Each File Actually Does
 
-This project has two completely separate authentication systems, because it
-has two completely different kinds of caller:
+### `config.py`
+**Job:** Read `.env`, expose `settings.DATABASE_URL` and `settings.JWT_SECRET_KEY`.
+**Contains:** Zero logic. Just environment loading.
+**You touch this:** Almost never, after initial setup — maybe to add new
+settings as your app grows (e.g. a `WS_HEARTBEAT_INTERVAL_SECONDS` setting
+once the WebSocket heartbeat timing needs to be tunable rather than
+hardcoded).
 
-| | **Agents** (machines) | **Admin users** (humans) |
-|---|---|---|
-| Who | An unattended process running on a customer's endpoint | You, logging into the dashboard |
-| How it proves identity | A long-lived, randomly generated `api_key`, sent with every request | A username + password login, exchanged for a short-lived JWT |
-| Where credentials come from | Issued once by the server, at registration time | Chosen by the admin, stored as a bcrypt hash |
-| Lifespan of the credential | Indefinite (until revoked/deleted) | JWT expires after 24 hours; must log in again |
+### `db/database.py`
+**Job:** Create the async engine (connection pool), the session factory, the
+shared `Base` class, and the `get_db()` dependency used by every router.
+**Contains:** Zero business logic. Just plumbing.
+**You touch this:** Almost never — maybe to tune pool settings (`pool_size`,
+`echo=False` for production) later. Worth revisiting once the WebSocket
+manager is issuing DB writes at a higher frequency than the admin/HTTP side
+ever did — a pool sized for occasional heartbeats may not be sized for a
+continuous event stream from many agents.
 
-### 3.1 Agent identity: enrollment token → api_key
+### `db/models.py`
+**Job:** Mirror your Postgres tables as Python classes (SQLAlchemy ORM).
+**Contains:** Column definitions, types, constraints, foreign keys,
+relationships. **No logic** — no validation, no business rules, no request
+handling.
+**You touch this:** Every time you add or change a table.
 
-An agent can't "log in" the way a human does — there's no one sitting at
-the keyboard to type a password every time it phones home. So agent
-authentication is split into two distinct secrets with two different
-lifespans:
+### `schemas/*.py`
+**Job:** Define what a valid API *request* and *response* look like —
+independent from the DB structure.
+**Contains:** Pydantic classes. No DB queries, no business logic — just shape
++ validation rules.
+**You touch this:** Every time you add an endpoint, or change what an
+endpoint accepts/returns.
+**Why it's separate from `models.py`:** the DB table often has fields the
+client should never send (`agent_id`, `created_at`) or never see again
+(`api_key`, `password_hash`). Schemas let you control exactly what's
+exposed, per-endpoint. The same principle applies to the WebSocket event
+envelope (`schemas/event.py` or similar): the inbound message an agent sends
+and the row that ends up in Postgres are related but not identical — the
+inbound schema should validate `event_id`, `class_uid`, `category_uid`,
+`data`, etc., while `created_at` and any server-computed fields stay
+out of what the client is allowed to set.
+
+### `routers/*.py`
+**Job:** This is where actual logic lives — the real "what happens when this
+endpoint is called."
+**Contains:**
+- Reading input (validated automatically via the schema type hint)
+- Querying/writing to the DB via `db.execute(select(...))`, `db.add(...)`,
+  `db.commit()`
+- Business rules (token expiry checks, credential checks, generating secrets)
+- Raising `HTTPException` for error cases
+- Returning data shaped by a response schema
+
+**You touch this:** Every time you build a new feature/endpoint. Note that
+the WebSocket event-ingestion endpoint (`/agent/ws` or similar) is *not* a
+normal `@router.post(...)` — it's typically defined with
+`@router.websocket(...)` and has a different lifecycle: it doesn't return
+once and finish, it stays open, loops on incoming messages, and needs
+explicit handling for disconnects. Keep this handler thin the same way you'd
+keep a normal router thin — parse the incoming event, hand it to a shared
+"store event" function (also usable by any future HTTP-based ingestion
+path), send the ack, and let `detection/` handle anything beyond storage.
+
+### `core/security.py`
+**Job:** Password hashing and JWT create/verify — pure functions, no request
+handling, no DB access.
+**Contains:**
+- `hash_password()` / `verify_password()` — bcrypt via passlib
+- `create_access_token()` / `decode_access_token()` — JWT via python-jose,
+  signed with `settings.JWT_SECRET_KEY`, 24h expiry
+**You touch this:** Rarely — maybe to change token expiry duration or add
+a refresh-token flow later.
+
+### `core/deps.py`
+**Job:** FastAPI dependencies that guard routes — currently just
+`get_current_user_id`.
+**Contains:** Reads the `Authorization: Bearer <token>` header, calls
+`decode_access_token()`, raises `401 not authenticated` on anything missing/
+invalid/expired, otherwise returns the `user_id` from the token.
+**You touch this:** To protect any new route, add
+`Depends(get_current_user_id)` as a parameter — no changes needed to this
+file itself unless you add new kinds of guards (e.g. role-based checks
+later). Note this dependency is designed for the human/admin JWT flow —
+agent authentication (`agent_id` + `api_key`, including on the WebSocket
+connection) is a *separate* check and should live in its own small function
+(e.g. `verify_agent_credentials()`), not be bolted onto `get_current_user_id`.
+
+### `core/deps.py` → agent-side equivalent (recommended, if not already split out)
+**Job:** The WebSocket connection handler needs its own authentication check
+at connect time — an agent presents `agent_id` + `api_key` once, when the
+socket is opened, not on every message afterward (unlike HTTP, where every
+request re-sends the JWT). Once the connection is authenticated, the server
+should hold that agent's identity in the connection's state for the life of
+the socket, rather than re-verifying per event — re-checking the DB on every
+single event would add needless load to a high-frequency stream.
+
+### `detection/` and `response/`
+**Job (once you build into them):**
+- `detection/` — turns raw event data into a `score` / `verdict` (rules,
+  thresholds, eventually ML).
+- `response/` — takes a verdict and *does something* (isolate a host, kill a
+  process, alert an admin).
+
+These are kept separate from `routers/` so your "receive a request" logic
+never gets tangled up with your "decide if this is malicious" logic. A router
+(or the WebSocket handler) should call into `detection/` or `response/`, not
+contain that logic itself. Concretely: the WebSocket handler's job ends once
+an event is validated, stored, and acknowledged — it should not itself
+decide "this looks like a brute-force attempt." That belongs in `detection/`,
+running either synchronously right after storage or, once volume grows, as a
+separate background pass over recently-stored events.
+
+### `main.py`
+**Job:** Create the `FastAPI()` app, register (`include_router`) every
+router, nothing else.
+**Contains:** No business logic. Just wiring. The WebSocket router is
+included the same way as any HTTP router (`app.include_router(ws.router,
+tags=["telemetry"])`) — it doesn't need special treatment at this layer.
+
+---
+
+## 3. How Agent Authentication Works (`api_key`)
+
+Every agent needs a way to prove "it's still me" on every request after it
+first connects — without the server having to trust just an IP address or a
+hostname (both are easy to spoof). That's what `api_key` is for: a long,
+random, secret string that acts like a password, but for a machine instead
+of a human.
+
+### 3.1 The problem it solves
+
+Your admin uses a **username + password** to log in as a human, once per
+session, and gets a temporary JWT back.
+
+An **agent** is different — it's an unattended process running on a
+customer's endpoint that needs to check in repeatedly (heartbeats, and now
+also a persistent event stream) with no human present to type a password.
+So instead of "login every time," an agent gets issued **one long-lived
+secret** at the moment it registers, and it sends that secret with every
+future request instead of logging in.
+
+For the WebSocket connection specifically, the `api_key` is sent once at
+connection time (e.g. in the initial handshake message or a header on the
+upgrade request), not on every individual event — see the note in section 2
+under `core/deps.py` (agent-side equivalent).
+
+### 3.2 The full flow, end to end
 
 ```
-1. Admin generates a one-time enrollment token
-      POST /admin/generate-token   (protected — requires admin JWT)
-      → random token, valid 1 hour, single-use, tagged with tenant_id
+1. Admin (you) generates a one-time enrollment token
+      POST /admin/generate-token   (requires admin JWT — protected route)
+      → returns a random token, valid for 1 hour, single-use
 
-2. Token is handed to the new machine — now via the real one-line
-   install command generated in GenerateTokenModal.jsx, which
-   downloads the agent binary AND runs it with the token in one step
+2. That token gets baked into the install script/binary
+   you hand to the customer (e.g. as a --token flag or embedded
+   in a downloaded install command)
 
-3. Agent registers itself using that token
+3. Customer downloads and runs the script on their machine
+      .\edr-agent.exe --server=http://<your-server-ip>:8000 --token=<the enrollment token>
+
+4. The agent calls the server to register itself
       POST /agent/register
-      body: { hostname, os, enrollment_token, ip_address, mac_address }
+      body: { hostname, os, enrollment_token }
 
-      Server:
-        - looks up the enrollment token
-        - rejects if missing / expired / already used
-        - generates a NEW random api_key (secrets.token_urlsafe(32))
-        - creates the Agent row, storing that api_key + ip/mac address
-          + tenant_id (see 3.5 below)
-        - marks the enrollment token as used (can't be reused)
-        - returns { agent_id, api_key } — the ONE TIME the api_key
-          is ever sent back to a client
+      Server checks (routers/agent.py -> register_agent):
+        - does this enrollment token exist?
+        - has it expired? (1 hour window)
+        - has it already been used?
+      If all checks pass:
+        - server generates a NEW random api_key (secrets.token_urlsafe(32))
+        - creates the Agent row, storing that api_key
+        - marks the enrollment token as used (so it can't be reused
+          to register a second agent)
+        - returns { agent_id, api_key } to the agent — ONE TIME ONLY
 
-4. Agent saves { agent_id, api_key } locally as its permanent credential
-   (config.json, under ProgramData on Windows or /etc on Linux)
+5. The agent saves { agent_id, api_key } locally
+   (its own config file on the customer's machine — this is now the
+   agent's permanent credential, like a long-lived password)
 
-5. Every heartbeat afterward re-uses these saved credentials
+6. Every heartbeat after that, the agent sends its saved credentials
+   instead of re-registering
       POST /agent/heartbeat
       body: { agent_id, api_key }
 
-      Server checks:
+      Server checks (routers/agent.py -> heartbeat):
         - does an agent with this agent_id exist?
-        - does its stored api_key match?
-        - is its status "active" (not "revoked")?
-      Any failure → the same generic 401 "invalid credentials"
-      (never reveals which check failed, so a probing attacker can't
-      enumerate valid agent_ids or infer an agent's revoked status)
+        - does its stored api_key match the one just sent?
+      If either check fails -> same generic 401 "invalid credentials"
+      (never reveals which part was wrong, so an attacker probing the
+      endpoint can't tell if an agent_id is real or not)
+
+7. Separately, the agent opens a persistent WebSocket connection for
+   telemetry, authenticating once at connect time with the same
+   { agent_id, api_key } pair. This connection stays open independently
+   of the heartbeat cycle — a dropped WebSocket does not mean the agent
+   is unregistered, and vice versa.
 ```
 
-**IP + MAC collection, added this phase:** the Go agent's
-`netinfo.go` walks the machine's network interfaces once, skips
-loopback/disabled interfaces, and returns the IP and MAC from the *first*
-active interface it finds — both from the *same* interface, guaranteeing
-they describe one physical NIC rather than two mismatched ones. Both
-fields are optional on the wire; a machine with unusual networking that
-fails detection still registers successfully, just with `null` values.
+### 3.3 Why the enrollment token and the api_key are two different things
 
-**Why two separate secrets instead of one?** The enrollment token is
-deliberately short-lived and single-use — if it leaks, it's worthless after
-an hour and can't be reused to enroll a second, rogue device. The `api_key`
-that actually matters long-term is never transmitted until the one moment
-it's created, and from then on travels only between the agent and the
-server.
+| | `enrollment_token` | `api_key` |
+|---|---|---|
+| Purpose | One-time proof "an admin authorized this machine to join" | Ongoing proof "this is the same agent that registered before" |
+| Lifespan | 1 hour, single-use, then dead | Lives as long as the agent is enrolled |
+| Where it's used | Only once, in `POST /agent/register` | Every heartbeat, and once at WebSocket connect time |
+| Who generates it | The **server**, on admin request | The **server**, automatically, at registration time |
 
-**`api_key` is stored in plaintext** in `agents.api_key` — unlike
-`users.password_hash`. This is intentional for now: heartbeat verification
-does a direct string comparison, not a hash-and-compare like login does.
-This is a known simplification worth hardening before any real deployment
-(see `report.md` for the list of pre-production items).
+Splitting these apart means a leaked/expired enrollment token is useless
+after an hour and can't be reused to enroll a second (rogue) device, while
+the `api_key` that actually matters long-term is never sent over the network
+until the one moment it's created.
 
-### 3.2 Admin identity: username/password → JWT
+### 3.4 How `api_key` is generated (the actual code)
 
-```
-1. Admin submits credentials
-      POST /auth/login
-      body: { username, password }
-
-      Server:
-        - looks up the user by username
-        - hashes the submitted password (bcrypt) and compares to
-          the stored hash
-        - wrong username OR wrong password → same generic
-          401 "invalid credentials" (never reveals which was wrong)
-        - on success: signs a JWT containing { sub: user_id, exp: +24h }
-          using a server-only secret (settings.JWT_SECRET_KEY, HS256)
-        - returns { access_token, token_type: "bearer" }
-
-2. Dashboard stores the token in localStorage (see 3.3 below)
-
-3. Every subsequent request attaches it:
-      Authorization: Bearer <token>
-
-      core/deps.py → get_current_user_id():
-        - missing header, or doesn't start with "Bearer " → 401
-        - signature invalid or token expired → 401
-        - otherwise → returns the user_id embedded in the token
-```
-
-Any route that should require login adds one line:
+`routers/agent.py`, inside `register_agent()`:
 ```python
-current_user_id: str = Depends(get_current_user_id)
+new_api_key = secrets.token_urlsafe(32)
 ```
+`secrets.token_urlsafe(32)` uses Python's cryptographically secure random
+number generator (not the regular `random` module, which is predictable and
+unsafe for this) to produce a 32-byte random value, encoded as a URL-safe
+base64 string. This is the same function already used to generate
+enrollment tokens (`secrets.token_urlsafe(32)` in `admin.py`) — consistent
+approach for anything that needs to be an unguessable secret.
 
-**Changing a password requires the current password**, even though the
-caller already has a valid JWT (`PUT /auth/change-password`). A valid JWT
-proves "who you were when the token was issued" — it does not prove you
-should be allowed to make a sensitive account change right now.
+This key is:
+- **Never chosen or influenced by the client** — always fully random,
+  generated server-side, so there's no risk of a weak/predictable key
+- **Shown to the agent exactly once**, in the `POST /agent/register`
+  response (`AgentRegisterResponse` schema — the *only* schema that includes
+  `api_key`)
+- **Stored in plaintext in Postgres** (`agents.api_key`) — unlike
+  `users.password_hash`, this is intentional: heartbeat verification does a
+  direct string comparison (`agent.api_key != payload.api_key`), not a
+  hash-and-compare like login does. The WebSocket connect-time check follows
+  the same direct-comparison pattern. See the hardening notes below if you
+  want to upgrade this to a hashed comparison later.
+- **Excluded from every other response** — `GET /agents` uses `AgentResponse`,
+  which has no `api_key` field at all, so it's never visible to anyone
+  browsing the agent list, admin or not.
+- **Also stored in plaintext on the endpoint's local disk**
+  (`config.json`, alongside `agent_id` and the server URL). This is a
+  reasonable tradeoff for a prototype, but is worth flagging explicitly as a
+  pre-production item: on a compromised endpoint, this file is readable by
+  anyone with local access. Options worth considering later include OS-level
+  secret storage (Windows DPAPI / Linux keyring) or restricting file
+  permissions tightly (owner-only read).
 
-**Logout is stateless.** JWTs aren't tracked server-side in a sessions
-table — there's nothing to revoke. If a JWT is compromised, it remains
-valid until it naturally expires (24 hours) — there is currently no
-server-side revocation mechanism for admin tokens. (This is different from
-agents, which do have a revoke *and* un-revoke mechanism — see 3.4.)
+### 3.5 If an agent's `api_key` is ever compromised
 
-**There is no public signup route.** The first admin user is created by a
-one-time script (`create_admin.py`), run manually — a development tool,
-not a production onboarding flow.
+There's currently no "revoke and reissue" endpoint — if a customer's machine
+is compromised and its `api_key` leaks, the current options are:
+1. Manually delete/deactivate that row in `agents` via Postgres, and
+2. Have the agent re-run the registration flow with a fresh enrollment
+   token to get a new `api_key`
 
-**Not yet tenant-scoped:** `users` has no `tenant_id` column yet. The JWT's
-`sub` claim identifies *which admin* is logged in, but nothing about
-*which organization* they belong to. See 3.5 for why this matters and what
-still needs to change before Model 2.
+A dedicated `POST /admin/agents/{agent_id}/revoke` endpoint (protected,
+admin-only) is a reasonable future addition once you're past the prototype
+stage. When built, this should also actively close that agent's live
+WebSocket connection server-side (not just reject future heartbeats) — a
+revoked agent that still has an open socket could otherwise keep streaming
+events until it happens to disconnect on its own.
 
-### 3.3 How the dashboard uses the JWT and the server address
+---
 
-`dashboard/src/api.js` centralizes every backend call. A single `request()`
-helper:
-- Attaches `Authorization: Bearer <token>` automatically to any call marked
-  `auth: true` (the default) — pulling the token from `localStorage`.
-- Special-cases a `401` response: clears the stored token and throws a
-  distinct `AuthError`, which every page catches to redirect back to
-  `/login` via `forceLogout()`.
+## 4. How Telemetry Events Flow From Agent to Database
 
-The same file also exports `API_URL` — the single source of truth for
-where the FastAPI server lives, read from `VITE_API_URL` (falling back to
-`http://localhost:8000` in dev). This value now does double duty: it's
-used both for the dashboard's own API calls *and* to build the real
-one-line install command in `GenerateTokenModal.jsx` (see section 5).
-**These two uses have different correctness requirements** — the
-`localhost` fallback is fine for the dashboard's own calls when viewed
-locally, but is actively wrong for the install command, since that command
-runs on a *different* machine, where `localhost` means "call yourself." In
-practice this means `VITE_API_URL` should always be set explicitly to a
-real, externally-reachable address (LAN IP in dev/testing, public domain
-in production) as soon as the install command needs to leave the machine
-running the dashboard.
+This section covers the WebSocket ingestion path in more detail, since it's
+structurally different from every other endpoint in the project.
 
-### 3.4 Agent status: active, revoked, and back again
+### 4.1 On the agent side (already covered in the transport architecture doc)
 
-`agents.status` supports `"active"` and `"revoked"`. An admin can revoke
-an agent via `PATCH /admin/agents/{agent_id}/revoke` — after that,
-`POST /agent/heartbeat` will reject the agent's requests with the same
-generic `401 invalid credentials` as an invalid key. This is the mechanism
-for cutting off a compromised or decommissioned machine without needing to
-delete its history.
+The agent never lets an event depend on the server being reachable at the
+moment it happens: the event is written to a local durable outbox
+(`event_id`, `payload`, `status`) *before* delivery is attempted, and is only
+deleted from that outbox once the server has confirmed receipt. If the
+WebSocket connection drops, queued events remain locally and are resent —
+selectively, via reconciliation, not by re-sending the entire history — once
+the connection is restored.
 
-**Un-revoke, added this phase**: `PATCH /admin/agents/{agent_id}/unrevoke`
-sets status back to `"active"`. Nothing about the `api_key` changes at any
-point in this cycle — revoke and un-revoke are purely a status flag flip.
-Confirmed behavior: an agent that's still running (still attempting its
-quiet-retry heartbeat loop even while revoked) picks the reactivation up
-automatically on its very next heartbeat attempt, typically within the
-~30s loop interval, with zero action needed on the agent side.
+### 4.2 On the server side
 
-**Neither revoke nor delete stops the agent process on the actual
-endpoint.** Both are purely server-side database operations. A revoked or
-deleted agent's binary, if still running, will continue attempting
-heartbeats indefinitely — quietly failing every cycle by design (the
-agent's error-handling philosophy treats heartbeat failures as "log and
-retry," never "crash"). This is a known, expected property of the current
-design, not a bug — genuinely stopping a rogue or decommissioned agent
-requires action on the physical machine itself (killing the process,
-uninstalling, or — once built — a remote-kill capability, which doesn't
-exist yet).
+The WebSocket manager's responsibilities, per connection:
 
-A separate `DELETE /admin/agents/{agent_id}` permanently removes the row —
-this action has no "undo," unlike revoke.
+1. **Authenticate at connect time** — verify `agent_id` + `api_key` once,
+   when the socket opens (see section 3.2, step 7).
+2. **Keep the connection alive** — respond to heartbeat pings so the agent
+   can distinguish "connection is genuinely open" from "looks open but
+   isn't."
+3. **Receive and validate each event** — parse the incoming JSON payload
+   against the event schema (`schemas/event.py`), checking required fields
+   (`event_id`, `class_uid`, `category_uid`, `data`, etc.) the same way any
+   other schema validates a request body.
+4. **Store the event idempotently** — insert into `events`, using
+   `event_id` as the conflict target (e.g.
+   `INSERT ... ON CONFLICT (event_id) DO NOTHING`) so a retried delivery
+   after a lost acknowledgement doesn't create a duplicate row.
+5. **Acknowledge** — send a confirmation back over the same connection so
+   the agent knows it can safely delete that event from its local outbox.
+6. **Handle disconnects gracefully** — when a connection drops, the server
+   doesn't need to do anything special to "remember" the agent's pending
+   events; the agent's own durable outbox is the source of truth for what
+   still needs delivering. The server's job on reconnect is simply to accept
+   the new connection and process whatever the agent resends.
 
-### 3.5 Tenant scoping — the Model 1 → Model 2 bridge
+### 4.3 Idempotency in practice
 
-**What exists now:** an `organizations` table was added as the root tenant
-entity, seeded with a single static row:
+Because reliable delivery over an unreliable network implies **at-least-once**
+delivery (an event might be sent, received, and stored, but the
+acknowledgement lost — the agent then correctly retries), the database needs
+to be the actual safety net, not just agent-side logic. The `event_id`
+primary key constraint on `events` is what makes a duplicate delivery safe:
+the second insert attempt is a no-op rather than a second row, regardless of
+how many times or how the retry happens on the agent side.
 
+### 4.4 Multi-tenancy and multi-agent isolation
+
+Every row in `events` carries both `agent_id` and `tenant_id`. This isn't
+optional bookkeeping — it's what lets the exact same server code serve
+either deployment model described in section 3 of the main project
+blueprint: a single-office node where everything defaults to one tenant, or
+a centralized multi-tenant hub where hundreds of unrelated organizations'
+agents connect to the same backend. Every query in the `events` router (and
+eventually `detection/`) should filter by `tenant_id` as a matter of habit,
+even in the single-tenant deployment case, so that behavior doesn't have to
+change when scaling from Model 1 to Model 2.
+
+---
+
+## 5. The Checklist: Adding a New Table
+
+Every time you add a table, walk through these steps **in this order**:
+
+### Step 1 — Create the table in Postgres (source of truth)
 ```sql
-org_id: 00000000-0000-0000-0000-000000000001
-name:   "Default SME"
+CREATE TABLE alerts (
+  alert_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id uuid NOT NULL REFERENCES agents(agent_id),
+  severity text NOT NULL,
+  message text NOT NULL,
+  created_at timestamp NOT NULL DEFAULT now(),
+  resolved boolean NOT NULL DEFAULT false
+);
+```
+Verify with `\dt` and `\d alerts` in psql.
+
+### Step 2 — Add the model in `db/models.py`
+```python
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    alert_id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.agent_id"), nullable=False)
+    severity = Column(Text, nullable=False)
+    message = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    resolved = Column(Boolean, nullable=False, default=False)
+
+    agent = relationship("Agent", back_populates="alerts")
+```
+If you add a `relationship(...)`, remember to add the reverse side on the
+related model too (e.g. `alerts = relationship("Alert", back_populates="agent")`
+on `Agent`). **Gotcha you already hit once:** if you comment out or remove a
+model class, also comment out/remove any `relationship("ThatClass", ...)`
+pointing at it elsewhere — SQLAlchemy fails at mapper-configuration time with
+a `KeyError`/`InvalidRequestError` if a relationship references a class name
+that isn't registered.
+
+### Step 3 — Add schemas in `schemas/alert.py`
+Ask: what should a client be allowed to **send**, and what should they be
+allowed to **see back**? These are often NOT identical to the full model.
+```python
+class AlertCreate(BaseModel):
+    agent_id: UUID
+    severity: str
+    message: str
+
+class AlertResponse(BaseModel):
+    alert_id: UUID
+    agent_id: UUID
+    severity: str
+    message: str
+    created_at: datetime
+    resolved: bool
+
+    class Config:
+        from_attributes = True
 ```
 
-`tenant_id` foreign keys were added to `agents` and `enrollment_tokens`
-(both `NOT NULL`, referencing `organizations.org_id`). Every insert into
-either table — `POST /agent/register` and `POST /admin/generate-token` —
-now sets `tenant_id` to a hardcoded constant,
-`core/constants.py::DEFAULT_TENANT_ID`, matching the seeded default org.
+### Step 4 — Build the router in `routers/alerts.py`
+This is where the actual behavior lives:
+```python
+@router.post("/alerts", response_model=AlertResponse)
+async def create_alert(payload: AlertCreate, db: AsyncSession = Depends(get_db)):
+    new_alert = Alert(**payload.model_dump())
+    db.add(new_alert)
+    await db.commit()
+    await db.refresh(new_alert)
+    return new_alert
+```
 
-**What this is, precisely: bookkeeping, not isolation.** Every row in the
-system currently belongs to the same one tenant, by construction. No query
-anywhere filters by `tenant_id` yet — `GET /agents`, for example, still
-does an unconditional `select(Agent)` and returns every row regardless of
-tenant. That's correct and harmless under Model 1, where exactly one
-tenant exists, but it is **not** safe to reuse as-is under Model 2, where
-it would return every organization's agents to every logged-in admin
-without any filtering.
+If the route should be admin-only, add the auth dependency too:
+```python
+from core.deps import get_current_user_id
 
-**`events` now follows the same rule.** Its `tenant_id` column is
-`NOT NULL`, referencing `organizations.org_id`, same as `agents` and
-`enrollment_tokens` — see section 7 for how it gets set.
+@router.post("/alerts", response_model=AlertResponse)
+async def create_alert(
+    payload: AlertCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user_id: str = Depends(get_current_user_id),
+):
+    ...
+```
 
-**What still has to be built before Model 2 is real, not just schema-ready:**
+### Step 5 — Wire the router into `main.py`
+```python
+from routers import alerts
+app.include_router(alerts.router, tags=["alerts"])
+```
 
-1. **`users` needs its own `tenant_id` column.** It doesn't have one yet —
-   nothing currently ties an admin login to a specific organization.
-2. **The JWT needs a `tenant_id` claim**, sourced from that new
-   `users.tenant_id` column at login time (`POST /auth/login` in
-   `routers/auth.py`), alongside the existing `sub` (user id) claim.
-3. **Every admin-facing query needs a `.where(Model.tenant_id ==
-   current_tenant_id)` clause**, sourced from the decoded JWT via
-   `core/deps.py`. This applies to `GET /agents` today, and to any future
-   admin-facing route (including whatever eventually reads `events`).
-4. **Agent-facing routes stay keyed off the agent's own row**, not a JWT —
-   `POST /agent/heartbeat` and `POST /agent/events` should pull
-   `tenant_id` from the already-authenticated `Agent` row rather than
-   trusting a client-supplied value, so a compromised agent can't claim to
-   belong to a different tenant.
-5. **`DEFAULT_TENANT_ID` goes away** (or becomes purely a seed-data
-   convenience, not something routers reference at request time) once (1)–(3)
-   are in place.
-
-None of this is required for Model 1 to keep working correctly — it's
-listed here so the gap between "tenant-shaped schema" and "actual tenant
-isolation" is explicit and doesn't get assumed-away later.
+### Step 6 — Test via `/docs`
+Run the server, open `http://localhost:8000/docs`, and manually exercise the
+new endpoint(s) before building anything on top of them. For protected
+routes, test both without and with a valid `Authorization: Bearer <token>`
+header — confirm you get `401 not authenticated` in the first case.
+(Note: this `/docs` flow works for normal HTTP routers. The WebSocket
+endpoint isn't testable through Swagger UI the same way — use a small test
+client/script instead, the same pattern as your existing WebSocket test
+harness tools.)
 
 ---
 
-## 4. Folder Responsibilities
+## 6. The Checklist: Modifying an Existing Table
 
-| Path | Responsibility |
-|---|---|
-| `server/app/config.py` | Loads `.env`, exposes `settings.DATABASE_URL`, `settings.JWT_SECRET_KEY`. No logic. |
-| `server/app/db/database.py` | Async engine, session factory, shared `Base`, `get_db()` dependency. No business logic. |
-| `server/app/db/models.py` | SQLAlchemy classes mirroring Postgres tables. Structure only — no validation, no request handling. Now includes `Organization`, `Event`, and `Alert` alongside `EnrollmentToken`, `Agent`, `User`. |
-| `server/app/schemas/*.py` | Pydantic request/response shapes. Controls exactly what's accepted from clients and exposed back — including UTC-safe datetime serialization (see `api-contract.md`). |
-| `server/app/core/constants.py` | Shared constants — currently just `DEFAULT_TENANT_ID`, the single-tenant placeholder used by `agent.py` and `admin.py` at insert time (see 3.5). |
-| `server/app/core/security.py` | Password hashing (bcrypt via passlib) and JWT create/verify (python-jose). Pure functions — no DB access. |
-| `server/app/core/deps.py` | `get_current_user_id` — the FastAPI dependency that guards protected routes. |
-| `server/app/core/event_queue.py` | **Planned, not yet built.** In-process `asyncio.Queue` + background consumer absorbing event batches from `routers/agent.py` — see section 7. |
-| `server/app/routers/agent.py` | Agent-facing lifecycle: register, heartbeat. `POST /agent/events` planned, not yet built (section 7). Public routes, credential-based auth in the body. |
-| `server/app/routers/admin.py` | Admin-facing agent management: generate-token, revoke, unrevoke, delete. All JWT-protected. |
-| `server/app/routers/downloads.py` | Public binary distribution: serves the compiled Go agent binaries for the one-line install flow. |
-| `server/app/routers/auth.py` | Human login and password management. |
-| `server/app/detection/` | (Planned) Turns raw event data into a `score`/`verdict`. |
-| `server/app/response/` | (Planned) Takes a verdict and acts on it (isolate host, alert, etc.). |
-| `server/app/static/binaries/` | Compiled Go agent binaries served by `downloads.py`. Manually rebuilt/replaced — no automation yet. |
-| `server/app/main.py` | Creates the FastAPI app, registers routers, CORS middleware. Will also need to start/stop the event queue consumer once section 7 is built. |
-| `agent/` (Go, module `khemstrix-agent`) | Compiles to a single binary; registers, heartbeats, collects IP/MAC. Runs in the foreground only — no background service support yet (see `report.md`). Event batching (ring buffer, 50 events / 20s flush) is planned but not yet implemented in the Go agent. |
-| `dashboard/` (React + Vite) | Admin-facing UI: login, agent list (with IP/MAC/actions), enrollment token generation with real install command. See `api-contract.md` for exactly which endpoints it currently calls. |
-| `docs/` | This documentation set. |
+Say you want to add `ip_address` to `agents`:
+
+1. **Postgres:** `ALTER TABLE agents ADD COLUMN ip_address text;`
+2. **`db/models.py`:** add `ip_address = Column(Text)` to the `Agent` class
+3. **`schemas/agent.py`:** add `ip_address: Optional[str] = None` to
+   `AgentResponse` (and to `AgentCreate` only if clients should be allowed
+   to set it themselves)
+4. **`routers/agent.py`:** update logic if the new field needs to be set/used
+   somewhere (e.g. captured during registration)
+
+**Order matters:** always change Postgres first, then work back up through
+the layers. SQLAlchemy does not auto-sync with the database — you keep
+`models.py` in sync by hand (or via Alembic, see below).
 
 ---
 
-## 5. Binary Distribution — the One-Line Install Flow
+## 7. Rules of Thumb As You Scale
 
-A Wazuh-style single chained command that downloads and immediately runs
-the agent, replacing the earlier two-step "download the `.exe` manually,
-then run a separate command" placeholder.
-
-```
-1. Admin opens "Generate Enrollment Token" in the dashboard
-      → POST /admin/generate-token fires automatically
-      → GenerateTokenModal.jsx builds a real command using:
-          - API_URL (the dashboard's own server address, from
-            VITE_API_URL — must be reachable from the target machine,
-            not "localhost")
-          - the freshly generated, single-use token
-
-2. Admin copies the command (Windows PowerShell or Linux bash,
-   toggle in the modal) and runs it on the target machine
-
-3. That command:
-      a. Downloads the compiled binary from
-         GET /download/agent/windows (or /linux) — public, no auth
-      b. Immediately executes it with --server and --token flags
-
-4. The downloaded binary follows the normal registration flow
-   (section 3.1) — the download step and the registration step are
-   independent; the binary itself doesn't know or care how it got
-   onto the machine
-```
-
-**Binaries must be manually rebuilt and copied into
-`static/binaries/`** any time the Go agent's source changes — there's no
-CI/build pipeline connecting the two yet. A stale binary in that folder
-will keep being served even after source changes, silently — worth a
-manual checklist step ("did I rebuild and copy the binary?") any time
-`agent/` code changes before testing a fresh install.
-
-**Path resolution gotcha, fixed this phase:** `downloads.py` originally
-built the binaries folder path as a string relative to the current working
-directory, which broke depending on where `uvicorn` was launched from.
-Fixed by resolving relative to the router file's own location via
-`__file__`. This is now the pattern to follow for any future file-serving
-code in this project — never assume a particular working directory.
-
-**AV/heuristic flagging is expected, not a bug.** The compiled Windows
-binary was flagged by 2 of 60 VirusTotal engines, both generic
-ML-heuristic detections rather than signature matches. This is normal for
-any new, unsigned, zero-reputation executable that behaves like a
-monitoring agent (persistent background process, outbound network calls,
-system info collection) — legitimate EDR tools face the same friction
-before code-signing. Not a blocker for testing; a real requirement before
-any production distribution.
-
----
-
-## 6. Data Model Snapshot
-
-**Tables in Postgres:** `organizations`, `enrollment_tokens`, `agents`,
-`users`, `events`, `alerts`. `events` and `alerts` were brought online this
-phase — no longer commented out in `db/models.py`, and now exist in
-Postgres as real tables (see `phase2-event-schema.md` for the full
-OCSF field spec). Nothing currently writes to them yet — that's the
-ingestion pipeline described in section 7.
-
-```
-organizations               enrollment_tokens          agents                       users
-─────────────               ─────────────────          ──────                       ─────
-org_id (PK)          ◀────  token (PK)          ◀────  enrollment_token (FK)         user_id (PK)
-name                        created_at                 agent_id (PK)                 username (unique)
-created_at                  expires_at                 hostname                      password_hash
-   ▲                         used                        os                             created_at
-   │                         tenant_id (FK)              api_key (unique)
-   │                                                      status ("active"/"revoked")
-   │                                                      created_at
-   │                                                      last_seen_at
-   │                                                      ip_address
-   │                                                      mac_address
-   │                                                      tenant_id (FK)
-   │                                                          ▲
-   │                                                          │
-   └──────────────────────────────┐                           │
-                                    │                           │
-                              events                            │
-                              ──────                            │
-                              event_id (PK)                     │
-                              time                               │
-                              class_uid / category_uid /         │
-                                activity_id / type_uid            │
-                              severity_id                          │
-                              hostname / username                   │
-                              agent_id (FK)  ─────────────────────┘
-                              tenant_id (FK)  ─────────────────────┘
-                              metadata (jsonb)
-                              data (jsonb)
-                              created_at
-                                   ▲
-                                   │
-                              alerts
-                              ──────
-                              alert_id (PK)
-                              event_id (FK)
-                              class_uid (default 2004)
-                              technique_id
-                              d3fend_action
-                              risk_score
-                              source ("rule" / "ml_anomaly")
-                              requires_review
-                              created_at
-```
-
-**`organizations` is new this phase** — the root tenant entity described
-in section 3.5. Seeded with exactly one row (`"Default SME"`,
-`00000000-0000-0000-0000-000000000001`) for Model 1. `agents` and
-`enrollment_tokens` both gained a `NOT NULL` `tenant_id` foreign key
-pointing at it; every current insert path sets this to the seeded default
-via `core/constants.py::DEFAULT_TENANT_ID`. `users` does **not** yet have
-a `tenant_id` column — see 3.5 for why that's the next gap to close before
-Model 2 is meaningfully multi-tenant, not just multi-tenant-shaped.
-
-**Why `enrollment_token` isn't the primary key of `agents`:** it's a
-foreign key used purely for audit trail (which token authorized this
-agent's enrollment) — the agent's real identity going forward is
-`agent_id` + `api_key`.
-
-**Both `ip_address` and `mac_address` are nullable text columns**, added
-following the "Modifying an Existing Table" checklist in `developer.md`
-§3 — Postgres first, then `models.py`, then `schemas/agent.py`, then
-`routers/agent.py`. Both are optional by design: existing rows predating
-the change have no way to retroactively gain a value, and detection can
-legitimately fail on some network configurations.
-
-**`events.metadata` and `events.data` are JSONB, not a column per
-field.** OCSF's class-specific fields (`process{}`, `file{}`, `network{}`,
-etc.) vary by `class_uid`, so instead of one column per possible field
-across every class, only the Base Event fields that are shared across
-*all* classes (`time`, `class_uid`, `severity_id`, `hostname`, ...) are
-real indexed columns. Everything class-specific lives in `data`, queried
-via the GIN index when needed. Adding a new OCSF class later (e.g. Email
-Activity) needs no migration — just a new `class_uid` value and a new
-shape inside `data`.
-
-**`events.tenant_id` is denormalized, not derived via a join.** It's
-copied from `agents.tenant_id` at insert time rather than requiring every
-query to join through `agents` to filter by tenant. Same rule as section
-3.5 point 4: this value must come from the authenticated `Agent` row
-server-side, never from the client payload directly.
+- **`models.py` = structure only.** If you're tempted to write an `if`
+  statement in there, it belongs in a router or a service module instead.
+- **`schemas/` = contract with the outside world.** Never expose secrets
+  (`api_key`, `password_hash`) in a general-purpose response schema — only
+  in a dedicated one-time response schema (like `AgentRegisterResponse`),
+  or never at all (there is no `UserResponse` that includes `password_hash`,
+  and there shouldn't be).
+- **Routers should stay thin.** If a router function starts getting long
+  (validating, scoring, deciding a response action, sending alerts...),
+  pull the scoring/response logic out into `detection/` or `response/` and
+  have the router just call those functions. The same discipline applies to
+  the WebSocket handler — it should validate, store, and ack, and nothing
+  more.
+- **Same error for different failure reasons, when it matters for security.**
+  E.g. `heartbeat` returns the same `401 invalid credentials` whether the
+  `agent_id` doesn't exist or the `api_key` is wrong — this prevents an
+  attacker from enumerating valid agent IDs. `POST /auth/login` follows the
+  same rule: wrong username and wrong password both return the same
+  `401 invalid credentials`. Apply this to the WebSocket connect-time
+  auth check too.
+- **Never build raw SQL strings with f-strings/concatenation.** Always use
+  SQLAlchemy's `select(...)`/`.where(...)` or parameterized queries (`$1`,
+  `$2` with asyncpg). This is what protects you from SQL injection by
+  default — don't work around it.
+- **One-time secrets get their own response schema.** Anything like
+  `api_key` or a freshly generated token should have a dedicated `*Response`
+  schema used only at creation time, separate from the general "list/get"
+  response schema.
+- **A valid JWT proves "who you were when the token was issued," not
+  "confirm this sensitive change right now."** That's why
+  `PUT /auth/change-password` still requires the current password even
+  though the caller already passed the JWT check — a stolen/leaked token
+  shouldn't be enough on its own to lock the real owner out of their account.
+- **Postgres columns here are `timestamp without time zone`.** Always strip
+  `tzinfo` (`.replace(tzinfo=None)`) before storing a
+  `datetime.now(timezone.utc)` value, but return the tz-aware version in API
+  responses. JWT expiry (`exp` claim) doesn't hit this issue — `python-jose`
+  handles the conversion internally.
+- **At-least-once delivery means your database, not your application code,
+  is the real duplicate-prevention layer.** The WebSocket handler should
+  assume any event it receives might be a retry, and rely on the
+  `event_id` primary key / `ON CONFLICT DO NOTHING` pattern rather than
+  trying to track "have I seen this before" in memory.
+- **A persistent connection has state a stateless HTTP request doesn't.**
+  Don't reach for the same mental model you use for routers when writing
+  the WebSocket handler — think about what happens on connect, on each
+  message, on a clean disconnect, and on an unexpected drop, as four
+  distinct code paths.
 
 ---
 
-## 7. Event Ingestion Pipeline — Design, Not Yet Built
+## 8. When Your Schema Starts Changing Often: Alembic
 
-**Status: planned.** Nothing in this section exists in code yet — no
-`POST /agent/events` route, no `core/event_queue.py`, no agent-side ring
-buffer. This section documents the agreed design so implementation can
-follow it directly when it's picked up, rather than re-deriving it from
-scratch. It follows the same "Postgres first, then the rest" discipline as
-every other schema change in this project — here, Postgres (`events`,
-`alerts`) is already done; the code that writes to it is the remaining
-work.
+Right now you're manually keeping Postgres and `models.py` in sync by hand.
+That's fine at this stage, but once you have several tables and are changing
+things frequently (especially with teammates, or once you deploy), consider
+introducing **Alembic** — a migration tool for SQLAlchemy that:
 
-### 7.1 Why batching, not one request per event
+- Tracks every schema change as a versioned Python script
+- Lets you upgrade/downgrade the database automatically (`alembic upgrade head`)
+- Removes the need to manually remember and re-type `ALTER TABLE` statements
+- Keeps a history of every schema change, which is invaluable once this
+  isn't just a single local database anymore
 
-A single monitored endpoint can generate many events per second (file
-writes, process spawns, socket opens). One HTTP request per event would
-mean hundreds of requests/second even for a small office of monitored
-machines — real cost on hardware that Model 1 deliberately keeps cheap
-(an existing office workstation or mini-PC, not a dedicated server, per
-`README.md` section 3). Every request pays roughly the same fixed
-overhead — TCP/TLS handshake, credential lookup, DB session — regardless
-of whether it carries one event or fifty, so batching amortizes that cost.
-It's also more resilient on the flakier office internet this project
-targets: one flush every ~20s is a much smaller unit to retry than
-hundreds of individual requests.
+You don't need it yet — but once you're actively iterating on the `events`
+schema (finalizing the field contract mentioned in the project blueprint) or
+setting up a second environment (e.g. deploying to a real server), that's
+the signal to introduce it.
 
-**Agent side (planned):** a ring buffer holds up to 50 events, flushed
-either when full or after 20 seconds (with jitter, to avoid every agent
-in an office flushing in the same instant) — whichever comes first. One
-flush = one `POST /agent/events` call carrying a JSON array of events.
+---
 
-### 7.2 Why an in-process queue, not a synchronous insert
+## 9. Current Project Snapshot (as of this guide)
 
-Model 1 deliberately avoids external brokers (Redis, etc.) — see
-`README.md` section 3, "event ingestion uses an in-process asynchronous
-queue rather than external brokers ... to run reliably on low-spec
-hardware." The planned design:
+**Tables in Postgres:** `enrollment_tokens`, `agents`, `users`, and now
+`events` — created and actively receiving data through the WebSocket
+ingestion path (`agent_id`, `tenant_id`, `event_id` primary key,
+`class_uid`/`category_uid`/`activity_id`/`type_uid` fields, `data` JSONB,
+`created_at`). This has moved from "planned, commented out" to "live and
+validated": durable delivery, reconnection, reconciliation, and duplicate
+protection have all been exercised against this table with real inserts, not
+just tested in isolation.
 
-```
-POST /agent/events
-      │
-      ▼
-verify agent_id + api_key (same pattern as heartbeat)
-      │
-      ▼
-stamp agent_id + tenant_id from the authenticated Agent row
-      │  (never trust these from the client payload — 3.5 point 4)
-      ▼
-push the batch onto an in-process asyncio.Queue
-      │
-      ▼
-return 202 immediately — the HTTP response does not wait on the DB write
-      │
-      ▼ (separate background task, started at FastAPI startup)
-background consumer drains the queue, one batch at a time
-      │
-      ▼
-bulk insert into `events` (ON CONFLICT DO NOTHING on event_id,
-  so a client retry after a dropped response doesn't double-insert)
-```
+**New folder: `core/`**
+- `core/security.py` — password hashing (bcrypt via passlib) and JWT
+  create/verify helpers (python-jose, `HS256`, 24h expiry, signed with
+  `settings.JWT_SECRET_KEY`). Pure functions — no DB access, no request
+  handling.
+- `core/deps.py` — `get_current_user_id`, a FastAPI dependency that reads
+  the `Authorization: Bearer <token>` header, verifies it, and either
+  returns the `user_id` or raises `401 not authenticated`. Add this as a
+  `Depends()` on any route that should require login. Agent-side
+  authentication (heartbeat and WebSocket connect) uses a separate,
+  simpler check against `agent_id` + `api_key` — keep that logic distinct
+  from this human-auth dependency rather than merging the two.
 
-This decouples "how fast agents can flush" from "how fast Postgres can
-absorb writes" — without it, N agents flushing at once means N concurrent
-DB transactions competing for the same connection pool on a single
-low-spec machine.
+**New schema file: `schemas/auth.py`**
+- `LoginRequest` — `username`, `password`
+- `TokenResponse` — `access_token`, `token_type` (defaults to `"bearer"`)
+- `ChangePasswordRequest` — `current_password`, `new_password`
 
-### 7.3 Open questions before this gets built
+**New router: `routers/auth.py`, mounted at `/auth`**
+- `POST /auth/login` — looks up the user, verifies the password hash,
+  returns a JWT on success. Same generic `401 invalid credentials` for
+  "user doesn't exist" and "wrong password."
+- `PUT /auth/change-password` — protected route (requires a valid JWT).
+  Also requires the caller to supply their *current* password before
+  setting a new one, even though they're already authenticated — this
+  prevents a stolen token alone from being enough to lock out the real
+  admin.
 
-- Exact request/response shape for `POST /agent/events` (schema in
-  `schemas/agent.py`, alongside `AgentHeartbeat`).
-- Queue backpressure behavior if the consumer falls behind: block the
-  producer (slow the agent down) vs. reject with a retryable error.
-  Current lean is block, since losing events silently is worse than a
-  slow flush.
-- Whether `type_uid` is recomputed server-side (`class_uid * 100 +
-  activity_id`) rather than trusted from the agent payload, matching the
-  "Calculated" rule in `phase2-event-schema.md` section 1.
+**Telemetry ingestion (WebSocket):** implemented and validated against a
+live backend and two independently registered agents (one Windows, one
+Linux). See section 4 above for the detailed flow. Not yet integrated into
+the production agent's real collectors — current validation used a
+standalone test harness (`testpush`/`testreconnect`/`dumpoutbox`) to
+exercise the pipeline end to end.
+
+**Bootstrapping the first admin: `create_admin.py`**
+A one-time CLI script (run manually, not exposed via any endpoint) that
+prompts for a username/password and inserts the first row into `users`,
+with the password hashed via `core/security.hash_password()`. There is no
+public signup route — this is intentional. This script is a **development/
+testing tool**, not a production onboarding flow; see the note at the end of
+this section for what a real deployment would need instead.
+
+**Endpoints built:**
+- `POST /auth/login` — admin login, returns JWT
+- `PUT /auth/change-password` — admin changes their own password (protected)
+- `POST /admin/generate-token` — admin creates a one-time enrollment token
+  (**protected** — requires `Authorization: Bearer <token>`)
+- `POST /agent/register` — new agent registers using a valid enrollment token
+- `POST /agent/heartbeat` — registered agent proves it's alive
+- `GET /agents` — list all agents, excludes `api_key`
+  (**not yet protected** — see "Next natural additions" below)
+- `WS /agent/ws` (naming may differ in your actual code) — persistent
+  telemetry ingestion channel, authenticated once at connect time
+
+**How to test the full auth flow via `/docs`:**
+1. `POST /admin/generate-token` with no `Authorization` header →
+   expect `401 {"detail": "not authenticated"}`
+2. `POST /auth/login` with your admin username/password →
+   copy the `access_token` from the response
+3. Call `POST /admin/generate-token` again, this time manually adding header
+   `Authorization: Bearer <token>` → expect a `200` with the enrollment token
+   (note: since this dependency is a plain `Header(...)` check rather than
+   FastAPI's `OAuth2PasswordBearer` scheme, the Swagger "Authorize" lock icon
+   in `/docs` won't auto-attach the header — set it manually per-request, or
+   test with curl/Postman)
+
+**Next natural additions**, in likely order:
+1. Protect `GET /agents` the same way `/admin/generate-token` is protected
+   — currently it's the one remaining open route that probably shouldn't be
+2. Real-agent integration for the WebSocket client — the test harness has
+   proven the pipeline works; the production agent's own runtime still
+   needs to generate events through the same path rather than a separate
+   test binary
+3. `detection/` scoring logic — turn raw events into `score` + `verdict`
+4. `response/` actions — act on verdicts (isolate host, alert, etc.)
+5. Alembic, once schema changes become frequent
+6. Admin dashboard frontend (`dashboard/`, currently just planned) — login
+   page, protected routes on the frontend side, token storage
+   (localStorage is fine for a local-network student prototype; note it as
+   a pre-production hardening item alongside HTTPS and multi-tenancy)
+7. Production-grade admin bootstrapping — `create_admin.py` is a dev/testing
+   tool, not something you'd hand to a real SME customer. Before any real
+   deployment, replace or supplement it with one of: (a) auto-generate a
+   random admin password on first startup and print it once to the console/
+   logs, (b) force a password change on first login via a
+   `must_change_password` flag, or (c) a first-run setup wizard in the
+   dashboard that prompts the user to choose their own admin credentials.
+8. `api_key` revocation endpoint (section 3.5) and at-rest protection for
+   `config.json` on the endpoint — both currently open pre-production
+   hardening items worth tracking alongside the dashboard/Alembic items
+   above rather than forgetting about them once things "work."
