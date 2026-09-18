@@ -1,5 +1,5 @@
 # KhemStrix EDR — WebSocket Durable Delivery: Full Status Report
-**Originally September 15, 2026 — updated September 17, 2026 with multi-agent and larger-backlog testing results**
+**Originally September 15, 2026 — updated September 17 with multi-agent and larger-backlog testing — updated again September 18 to confirm real-agent integration, record the new event fields added to Postgres, and lay out the collector roadmap (auth → file → network)**
 
 ---
 
@@ -7,7 +7,7 @@
 
 KhemStrix EDR is an Endpoint Detection & Response (EDR) system for small-to-medium businesses in Cambodia. An "agent" (a small program) runs on each employee's computer, watches for suspicious activity (phishing emails, malware, brute-force login attempts), and reports what it sees back to a central server, where it's stored and analyzed.
 
-This report covers one specific piece of that system: **how events get from the agent to the server reliably**, even when the network connection is unstable.
+This report covers one specific piece of that system: **how events get from the agent to the server reliably**, even when the network connection is unstable — and, as of this update, what real detection work is queued up now that the transport layer itself is finished.
 
 ---
 
@@ -129,75 +129,113 @@ One real bug was found and fixed along the way: the database stores times withou
 **Confirmed by real, hands-on testing** (using two small temporary test programs built specifically to exercise this code, since no real detection module exists yet to naturally trigger it):
 
 - **The full happy-path round trip**: an event was created, written to the local notebook, sent live over the WebSocket, saved by the server, confirmed back to the agent, and correctly erased from the local notebook — all steps verified directly (by inspecting both the local file and the database).
-- **The actual disconnect/reconnect scenario** — the most important test of all: the server was deliberately shut down, and an event was created *while it was down*. We confirmed the event sat safely in the local notebook, untouched, for as long as the server stayed down (even confirmed a second event queued up the same way during the same outage). Once the server came back online, the agent automatically reconnected, reconciled, resent both queued events, got them confirmed, and the local notebook ended up completely empty again — with the database showing exactly two rows, no duplicates.
+- **The actual disconnect/reconnect scenario** — the most important test of all: the server was deliberately shut down, and an event was created *while it was down*. We confirmed the event sat safely in the local notebook, untouched, for as long as the server stayed down. Once the server came back online, the agent automatically reconnected, reconciled, resent the queued events, got them confirmed, and the local notebook ended up completely empty again — with the database showing no duplicates.
 
-This was a genuine, deliberate test of a real outage — not a lucky coincidence — and it worked exactly as designed on the first properly-controlled attempt.
+This was a genuine, deliberate test of a real outage — not a lucky coincidence — and it worked exactly as designed.
 
-### 5.3 New as of September 17: larger backlogs and a second, independent agent
+### 5.3 September 17: larger backlogs and a second, independent agent
 
-Section 6 of the original version of this report listed "only tested with one single agent" as an open gap. That is now partially closed — here's exactly what was and wasn't tested.
+**Larger backlog, single agent:** 15 events were pushed in rapid succession while the server was deliberately down. All 15 queued locally without loss, and **all 15 reconciled and cleared automatically** once the server came back, with no manual intervention beyond restarting the server itself.
 
-**Larger backlog, single agent:** instead of one or two queued events, 15 events were pushed in rapid succession while the server was deliberately down. All 15 queued locally without loss, and — critically — **all 15 reconciled and cleared automatically** once the server came back, with no manual intervention beyond restarting the server itself. This is a meaningfully larger test than the original single-event and two-event cases.
-
-**A second, independently registered agent:** a Linux binary was cross-compiled from the same Go source (`GOOS=linux go build`) and run on a separate machine (Kali), going through the *real* registration flow — its own enrollment token, its own freshly generated `agent_id`/`api_key`, recorded as a genuinely separate row in the `agents` table. This was not a copy of the Windows agent's credentials; it's a second, independent identity.
+**A second, independently registered agent:** a Linux binary was cross-compiled from the same Go source (`GOOS=linux go build`) and run on a separate machine (Kali), going through the *real* registration flow — its own enrollment token, its own freshly generated `agent_id`/`api_key`, recorded as a genuinely separate row in the `agents` table.
 
 **What this second agent proved:**
-- The same 15-event backlog test, run independently on the Linux agent, behaved identically — all 15 queued during an outage, all 15 cleared on reconnect.
-- Both agents' backlogs were confirmed in Postgres to have reconciled within seconds of each other after the same server restart — effectively two agents recovering from the same outage concurrently, not sequentially one-at-a-time.
-- Every one of the 30 total events (15 per agent) landed with the **correct, distinct `agent_id`** — no event from the Windows agent was ever attributed to the Linux agent or vice versa, confirmed directly in Postgres, not inferred from logs.
+- The same 15-event backlog test, run independently on the Linux agent, behaved identically.
+- Both agents' backlogs reconciled within seconds of each other after the same server restart — two agents recovering from the same outage concurrently, not one-at-a-time.
+- Every one of the 30 total events (15 per agent) landed with the **correct, distinct `agent_id`** — no cross-contamination, confirmed directly in Postgres.
 
-**What this does *not* yet prove**, to be precise about the boundary of what was tested: this confirms **two** agents reconnecting and recovering correctly around the same time, with correct isolation. It does not yet prove the jitter/anti-stampede logic (section 4.6) actually spreads out reconnect timing under load — that specifically needs many agents (tens or hundreds) reconnecting at the exact same instant, which two agents recovering within a few seconds of each other doesn't stress-test. See the corrected Section 7 below for how this changes the priority of that remaining test.
+**What this did not yet prove**, to be precise: two agents recovering correctly is not the same as proving the jitter/anti-stampede logic (Section 4.6) actually spreads out reconnect timing under real load — that needs many agents (tens or hundreds), not two. Still open — see Section 7.
 
-### 5.4 A note on process, for the record
+### 5.4 September 18 — Confirmed: the real agent, not just test tools, is now streaming
 
-Along the way, several early status summaries turned out to be inaccurate — describing work as "done" when it hadn't been checked against the real files, or testing the wrong machine's credentials without realizing it, or hitting a file-permissions issue that had nothing to do with the actual code. Each of these was caught and corrected before being accepted as true. The lesson worth keeping: a status is not "done" until it's actually been run and observed, not just written down. The September 17 testing continued this discipline — every claim in Section 5.3 above was confirmed directly in Postgres, not assumed from console output.
+This closes what was, until this update, the single biggest open gap in the project.
+
+**The WebSocket client is wired into `run.go`.** The block that opens the local outbox, builds the WebSocket URL, constructs the client, and launches it (`go wsc.Run(ctx)`) now runs as a real part of the agent's startup sequence — alongside the existing heartbeat loop, not instead of it. If the outbox can't be opened or the WebSocket URL can't be built, the agent logs the problem and keeps running its heartbeat loop anyway; streaming failing to start is not allowed to take down the whole agent.
+
+**Confirmed with a packet capture, not just by reading the code:** a Wireshark capture of the actual production binary (`khemstrixAgent.exe`, not a test tool) showed one WebSocket connection staying open for the entire capture window, plus separate ~30-second-interval heartbeat HTTP calls — matching the `heartbeatInterval = 30 * time.Second` constant in `run.go` exactly. This is direct evidence that `wsc.Run(ctx)` is really running inside the shipped agent process.
+
+**Also confirmed while reviewing `run.go`:** the configuration-precedence protection already exists and works as intended — if the agent is started with a `--server` flag that disagrees with its saved `config.json`, the saved config wins and the mismatch is only logged, never silently honored. A stray or stale flag can no longer redirect a running agent's event stream to the wrong server.
+
+**What is still genuinely missing, now that the transport itself is done:** nothing generates a *real* event yet. The connection is live, authenticated, and idly reconciling zero events, because no collector has ever called `Push()` outside of the disposable test tools. This is now the actual next piece of work — see Section 7.
+
+### 5.5 September 18 — Five new fields added to the `events` table
+
+To support what the collectors in Section 7 will need to report, five columns were added to Postgres's `events` table (test data wiped first, since none of it was real):
+
+| Column | Type | Purpose |
+|---|---|---|
+| `schema_version` | `smallint`, default `1` | Lets every future consumer (backend, detection, dashboard) tell old event shapes apart from new ones without guessing |
+| `agent_version` | `text`, nullable | Which build of the agent produced this event — useful once there are real deployed agents in the field, not just test VMs |
+| `host_os` | `text`, nullable | `windows` / `linux` — needed because detection logic (e.g. brute-force SSH vs. brute-force RDP) will differ by platform |
+| `host_os_version` | `text`, nullable | Finer-grained OS detail alongside `host_os` |
+| `ingest_source` | `text`, default `'websocket'` | How the event arrived — everything today comes over the WebSocket, but Phase 5 (email/Telegram) will introduce other paths |
+
+**Important — this is only step one of a four-step change**, and the remaining three have not been done yet: the Postgres columns exist, but `db/models.py`, the WebSocket schema (`schemas/event.py` or equivalent), the WebSocket handler's insert logic, and the agent-side payload builder all still need to be updated before these columns hold anything but `NULL`/defaults. See Step 1 in Section 7.
 
 ---
 
 ## 6. What Has NOT Been Done Yet
 
-Being equally clear about the gaps matters as much as the wins. **This section has been corrected from the original version** based on the September 17 testing — two items changed.
+Being equally clear about the gaps matters as much as the wins. This section has been corrected twice now — first on September 17, again on September 18.
 
-1. **No real detection module exists yet.** Nothing in production actually calls the "send this event" function — everything verified so far used a temporary throwaway test program, not the real agent. *(Unchanged.)*
-2. **The WebSocket client is not wired into the real agent yet.** It has never run as part of `run.go` / the actual agent binary — only inside the separate test programs. *(Unchanged — this remains the single biggest gap.)*
-3. **~~Reconnect-storm behavior is untested. We've only ever tested with one single agent.~~ Corrected:** two independently registered agents (Windows + Linux) have now been tested, including simultaneous-ish backlog recovery, with confirmed correct isolation (Section 5.3). What remains genuinely untested is **jitter behavior at real scale** — many agents (tens or hundreds) reconnecting at the exact same instant, which two agents recovering a few seconds apart doesn't exercise.
-4. **The local notebook has no size limit yet.** During a very long outage, it could theoretically grow without bound and fill up a disk. Needs a cap-and-alert policy — not urgent, but should not be forgotten. *(Unchanged — 15 events is nowhere near the scale this concern is about.)*
-5. **Reconciliation isn't chunked.** If an agent were offline for a very long time with a huge backlog, the "here's my list of unsent IDs" message could get large. 15 events at once reconciled cleanly with no chunking; this hasn't been tested at an order of magnitude closer to the real concern (thousands to hundreds of thousands of events). *(Unchanged in substance, now with a data point showing it's fine at small scale.)*
-6. **The event contract mismatch is unresolved.** An earlier design document describes a different event shape (`event_type`, `raw_data`, `extracted_features`) than what's actually implemented and tested (`class_uid`, `category_uid`, etc. plus a generic `data` field). These need to be reconciled before more detection modules get built against either one. *(Unchanged.)*
-7. **Multi-tenancy is now confirmed present at the schema level, but not exercised as a real feature.** Every event row observed during testing (both Windows and Linux agents) carried a `tenant_id` column, populated with the same default tenant UUID. This means the *scaffolding* the original Step 4 asked for already exists — but it has only ever been tested with a single tenant. Whether a second, genuinely different `tenant_id` correctly isolates data between two organizations has not been tested. See the corrected Section 7 below.
+1. ~~**The WebSocket client is not wired into the real agent yet.**~~ **Resolved as of September 18** — confirmed via Wireshark capture of the real production binary (Section 5.4). No longer an open item.
+2. **No real collector exists yet.** Nothing calls `wsclient.Push()` outside of the disposable `testpush`/`testreconnect` test tools. This is now the single biggest actual gap, and the direct blocker on everything in Section 7 below.
+3. **The five new Postgres columns (Section 5.5) are not wired through the rest of the stack.** `db/models.py`, the inbound WebSocket schema, the insert logic in the WebSocket handler, and the agent-side payload builder all still need updating — the columns exist but nothing populates them yet.
+4. **The event contract is still not finalized in practice.** Every test event so far has used the same placeholder `class_uid`/`category_uid`/`activity_id`/`type_uid`/`severity_id` values (1001/1/1/100101/1). No real event type has been assigned its own values yet — that has to happen before the first real collector is built, not after.
+5. **No TLS.** Traffic is still plaintext `ws://`/`http://`, confirmed via Wireshark — meaning `api_key` and all event data are currently readable on the wire. Fine while testing on a private LAN with synthetic data; must happen before any real endpoint data (real usernames, command lines, IPs) starts flowing.
+6. **Jitter/reconnect-storm behavior is still untested at real scale.** Two agents recovering together (Section 5.3) doesn't stress-test the anti-stampede logic — that needs something closer to 10–50+ simultaneous agents.
+7. **The local outbox has no size limit yet.** A very long outage could theoretically let it grow unbounded and fill a disk. Not urgent, but shouldn't be forgotten.
+8. **Reconciliation isn't chunked.** Confirmed fine at 15 events; untested anywhere near the scale (thousands+) where a single reconcile message could become unwieldy.
+9. **Multi-tenancy exists at the schema level but isn't exercised.** Every event observed so far carries a `tenant_id`, but always the same default value — genuine isolation between two different tenants hasn't been tested.
+10. **A minor, low-severity shutdown-ordering note.** A goroutine in `run.go` closes the outbox the instant shutdown begins, running concurrently with the WebSocket client's own goroutines, one of which could still be mid-flight trying to mark an event acked. Not currently causing visible problems, and self-heals via reconciliation on the next reconnect even in the worst case — worth understanding, not urgent to fix.
 
 ---
 
 ## 7. What We Need to Do Next — In Order
 
-**This section has been corrected from the original version.** Two of the original seven steps were based on assumptions that the September 17 testing has since confirmed or changed — see the notes under Steps 2 and 4 below.
+**This section has been substantially rewritten for September 18.** With real-agent integration now confirmed (Section 5.4), the priority order has shifted from "get the transport working" to "get real data flowing through it, safely."
 
-### Step 1: Wire the WebSocket client into the real agent
-Right now, everything works only inside disposable test programs. The next concrete step is adding the WebSocket client into `agent/internal/core/run.go`, so it starts up automatically alongside the agent's existing heartbeat loop, using the same saved credentials — making this a real, permanent part of the agent rather than a side experiment. **This remains the top priority and has not changed** — it's the one gap that blocks everything downstream of it, including real telemetry collection.
+### Step 1: Finish wiring the five new event fields all the way through
+Adding the Postgres columns (Section 5.5) was only the first of four layers. In order:
+1. `db/models.py` — add the five columns to the `Event` model class.
+2. The inbound WebSocket schema — decide per field who sets it: the agent should send `agent_version`, `host_os`, `host_os_version`, and `schema_version`; the server should set `ingest_source` itself rather than trusting the client to self-report its own transport.
+3. The WebSocket handler's insert logic — actually pass the validated values through into the row.
+4. The agent's payload-building code — populate these fields when constructing each event's JSON (`host_os` via Go's `runtime.GOOS`, already imported in `run.go`; `agent_version` needs a version constant that doesn't exist in the codebase yet).
 
-### Step 2 *(revised)*: Test jitter/reconnect behavior at real scale
-The original version of this step said "start several agent instances at once... proving jitter logic works with more than one agent." **That framing is now out of date** — two independent agents have already been tested reconnecting around the same time, with correct isolation (Section 5.3). What's actually still needed is testing at a scale that would meaningfully stress the anti-stampede jitter logic: closer to 10–50+ simultaneous agent instances (can be done as multiple processes on one machine, each with its own registered identity, for now — doesn't require separate physical hardware), stopping the server, bringing it back, and confirming from the logs/timestamps that reconnect attempts spread out over time rather than clustering in the same fraction of a second.
+### Step 2: Finalize the event contract, for real events this time
+Every test event so far has reused the same placeholder `class_uid`/`category_uid`/`activity_id`/`type_uid`/`severity_id` numbers. Before building the first real collector, decide the actual values for a failed-login event specifically — this both resolves the long-standing "event contract not finalized" gap and unblocks Step 3.
 
-### Step 3: Fix configuration precedence issues
-Two small but real cleanup items flagged earlier: remove a hardcoded server address from the Linux startup file, and make sure the agent always trusts its saved configuration file over any command-line flags it might be started with by accident. *(Unchanged — not affected by this week's testing.)*
+### Step 3: Build the first real collector — failed authentication attempts
+The first genuine, non-synthetic telemetry source, and the direct successor to "wire the WebSocket client into the agent," which is now done. Concretely:
+- **Windows:** watch the Security event log for Event ID `4625` (failed logon).
+- **Linux:** watch `/var/log/auth.log` (Debian/Ubuntu) or `journalctl` (systemd-based distros) for `sshd` authentication failures.
+- Build the event's `data` payload (attempted username, source IP if available, hostname, failure reason if the OS exposes one) using the values decided in Step 2, and the agent-level fields wired in Step 1.
+- Call `wsc.Push(eventID, payload)` — the same `wsc` instance already sitting authenticated and idle in `run.go`, confirmed live in Section 5.4.
+- Retest the outage scenario from Section 8, but with a real failed-login event this time instead of `testpush`'s placeholder payload.
 
-### Step 4 *(revised)*: Verify multi-tenant isolation, not build multi-tenant support from scratch
-The original version of this step said "create the `organizations` table structure, and add a `tenant_id` to the existing tables." **This is now partially done** — every event observed during testing already carries a `tenant_id` column (Section 6, item 7), so the schema-level scaffolding exists. What's actually left is verification, not construction: register two agents under two genuinely different `tenant_id` values (rather than both defaulting to the same one, as in all testing so far) and confirm that a query scoped to one tenant never returns the other's events — proving isolation actually holds, not just that the column exists.
+### Step 4: Add TLS (`wss://`)
+Should happen before or immediately alongside Step 3 — once real usernames and IP addresses are flowing over the wire (as they will be, starting with the auth collector), plaintext is no longer an acceptable tradeoff, even on a private LAN.
 
-### Step 5: Reconcile the event contract
-Decide, once and for all, on a single agreed shape for what an "event" looks like, and update whichever document is wrong (the older design doc or the implementation) so future work isn't built against two different ideas of the same thing. *(Unchanged.)*
+### Step 5: Repeat the same pattern for file monitoring, then network monitoring
+Once the auth collector proves the pattern end-to-end, file integrity monitoring (creation/modification/deletion/rename in sensitive directories) and network socket logging (outbound connections, for spotting C2 callbacks) are built the same way: their own `class_uid` values, their own `data` shape, the same `wsc.Push()` call. The outbox, reconciliation, and dedup machinery underneath doesn't change per collector — that was the entire point of building it as one shared pipeline instead of one-off code per feature.
 
-### Step 6: Build the first real detection module — email phishing
-This is the first genuine, real-world source of events: the agent will connect to an employee's email, look at incoming messages, extract useful signals in memory (never saving the actual email content to disk, per Cambodia's data protection rules), and feed the result into the now-working WebSocket path built and tested above. *(Unchanged — still appropriately last, since it depends on Step 1 being done first.)*
+### Step 6: Test jitter/reconnect behavior at real scale
+Still open and unchanged in substance from the September 17 revision: run 10–50+ simultaneous agent instances (multiple processes on one machine, each with its own registered identity, is sufficient for now), stop the server, bring it back, and confirm from timestamps that reconnects spread out rather than clustering in the same instant.
 
-### Step 7: Full real-world verification
-Once a real detection module exists, trigger an actual test phishing-style event, and confirm the entire path — from detection, to durable local storage, to WebSocket delivery, to database storage, to threat scoring — works correctly together, not just each piece in isolation. *(Unchanged.)*
+### Step 7: Verify multi-tenant isolation
+Register two agents under two genuinely different `tenant_id` values (rather than both defaulting to the same one, as in all testing so far) and confirm a query scoped to one tenant never returns the other's events.
+
+### Step 8: Lower-priority durability hardening
+Outbox size limits/retention policy for very long outages, and chunked reconciliation for very large backlogs. Neither is urgent at current scale (15 events tested cleanly), but both should happen before a real deployment with agents that could be offline for days.
+
+### Step 9 (optional): Understand, and eventually fix, the shutdown-ordering race
+Low severity, self-healing, not urgent — but worth eventually making airtight now that this is genuinely production code rather than an experiment.
 
 ---
 
 ## 8. How To Test This Yourself (After Pulling From GitHub)
 
-This section is for anyone (like a teammate) who pulls the repo fresh and wants to actually see the durable-delivery system working, not just read about it. It walks through the same steps we used to verify everything in Section 5, now including the larger-backlog and second-agent tests from Section 5.3.
+This section is for anyone (like a teammate) who pulls the repo fresh and wants to actually see the durable-delivery system working, not just read about it.
 
 ### 8.1 What you need running first
 
@@ -240,7 +278,7 @@ icacls C:\ProgramData\khemstrix-agent /grant Users:F /T
 
 ### 8.3 Build the two test tools
 
-These are small, throwaway programs (not part of the real agent) built specifically to exercise the outbox and WebSocket client directly, since no real detection module exists yet.
+These are small, throwaway programs (not part of the real agent) built specifically to exercise the outbox and WebSocket client directly, since no real collector exists yet.
 
 ```powershell
 cd agent
@@ -321,7 +359,7 @@ SELECT event_id, hostname, created_at FROM events WHERE hostname = 'reconnect-te
 
 If all seven steps check out, you've personally reproduced the exact test that validated this design — not just read that someone else did it.
 
-### 8.6 Test 3 *(new)* — A larger backlog during an outage
+### 8.6 Test 3 — A larger backlog during an outage
 
 Same idea as Test 2, but proving it holds up with more than one queued event.
 
@@ -348,11 +386,11 @@ SELECT event_id, COUNT(*) FROM events GROUP BY event_id HAVING COUNT(*) > 1;
 ```
 Zero rows back confirms duplicate protection held even under a larger backlog, not just a single event.
 
-### 8.7 Test 4 *(new)* — A second, independent agent
+### 8.7 Test 4 — A second, independent agent
 
 This proves agent isolation, not just durable delivery for one agent in isolation.
 
-1. Register a **second** agent identity — either cross-compile the Linux binary and run it on a separate machine/VM, or simply register a second Windows identity on the same machine using a fresh enrollment token (they'll each get their own `config.json` location if run from separate working directories).
+1. Register a **second** agent identity — either cross-compile the Linux binary and run it on a separate machine/VM, or simply register a second Windows identity on the same machine using a fresh enrollment token.
 2. Repeat Test 3 (the 15-event backlog test) independently for this second agent.
 3. Confirm in Postgres that every event from both agents carries the correct, distinct `agent_id`:
 ```sql
@@ -361,19 +399,22 @@ FROM events
 ORDER BY created_at DESC
 LIMIT 40;
 ```
-Check that events from each agent are attributed correctly and nothing is mixed up.
 
-### 8.8 Common gotchas (things that tripped us up, so you don't repeat them)
+### 8.8 Test 5 *(to be written once Step 3 in Section 7 is built)* — The first real collector
 
-- **Run the test tools on the same machine where the agent is actually registered.** `config.json` is local to whatever machine you're on — running the test tool from a different computer (e.g. your host instead of a VM) will read a *different* config file with different (possibly stale or nonexistent) credentials, and fail with a confusing "invalid credentials" error that has nothing to do with the actual code.
+Once the failed-authentication collector exists, repeat Tests 1–2 against it directly: deliberately fail a login on the endpoint (wrong password, a few times) instead of running `testpush.exe`, and confirm the resulting event — with its real `class_uid`, `host_os`, and `data` fields — survives an outage and reconciles the same way the synthetic test events always have. This is the point where "the transport works" and "the product works" finally become the same test.
+
+### 8.9 Common gotchas (things that tripped us up, so you don't repeat them)
+
+- **Run the test tools on the same machine where the agent is actually registered.** `config.json` is local to whatever machine you're on — running the test tool from a different computer will read a *different* config file with different (possibly stale or nonexistent) credentials, and fail with a confusing "invalid credentials" error that has nothing to do with the actual code.
 - **A leftover Windows service can lock the outbox file.** If you get a "readonly database" error, check `Get-Service | Where-Object { $_.Name -like "*khemstrix*" }` — if one is running, stop it first, and fix folder permissions as shown in 8.2.
 - **`--reload` on uvicorn can auto-restart the server on file changes**, which can accidentally interrupt your test at the wrong moment. If you're actively editing files nearby while testing, that restart isn't a real "server crashed" test — do a deliberate `Ctrl+C` instead, and don't touch files mid-test.
-- **Double-check which agent's credentials you're actually testing with** if your project has multiple registered agents (e.g. from earlier testing) — a stale or deleted agent's credentials will always fail auth, even though the failure looks identical to a real bug.
-- **New (from the September 17 testing): a service that "disappears" from `Get-Service` may have simply crashed, not been renamed or corrupted.** Check the System event log (`Get-EventLog -LogName System -Source "Service Control Manager"`) before assuming a lookup/permissions issue — if the process crashed, run the `.exe` directly first to see its actual error output, rather than fighting with service commands.
+- **Double-check which agent's credentials you're actually testing with** if your project has multiple registered agents from earlier testing — a stale or deleted agent's credentials will always fail auth, even though the failure looks identical to a real bug.
+- **A service that "disappears" from `Get-Service` may have simply crashed, not been renamed or corrupted.** Check the System event log (`Get-EventLog -LogName System -Source "Service Control Manager"`) before assuming a lookup/permissions issue — if the process crashed, run the `.exe` directly first to see its actual error output.
 - **A `"use of closed network connection"` log line right after a successful test push is very likely harmless connection cleanup, not a real failure** — confirm by checking the outbox; if it's empty, the event went through fine despite the alarming-looking log line.
 
 ---
 
 ## 9. One-Sentence Summary
 
-**The problem**: switching to instant delivery (WebSockets) risked losing security events whenever a connection dropped. **The solution**: never delete an event until the server confirms it, and automatically catch up on reconnect. **Status as of September 17**: this solution has been proven to survive a real server outage without losing or duplicating events — now confirmed with a larger backlog (15 events) and with two independently registered agents (Windows and Linux) recovering correctly and in isolation from each other — and the next job remains making it a permanent part of the real agent, instead of a test experiment, followed by verifying jitter behavior at real scale and confirming genuine multi-tenant isolation rather than assuming the schema alone guarantees it.
+**The problem**: switching to instant delivery (WebSockets) risked losing security events whenever a connection dropped. **The solution**: never delete an event until the server confirms it, and automatically catch up on reconnect. **Status as of September 18**: this solution is now confirmed running inside the real production agent (not just test tools), five new fields have been added to the database to support real telemetry, and the next job is finishing the wiring for those fields, locking down the event contract for real event types, and building the first genuine collector — failed authentication attempts — followed by file and network monitoring using the same proven pipeline.
