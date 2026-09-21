@@ -8,12 +8,16 @@
 // Usage from a collector:
 //
 //	id, payload, err := event.Build(event.Params{
-//	    ClassUID: 3002, CategoryUID: 3, ActivityID: 1, SeverityID: 3, // example values
+//	    ClassUID: 3002, CategoryUID: 3, ActivityID: 1, SeverityID: 2,
 //	    Username: "alice",
-//	    Data:     map[string]any{"src_ip": "10.0.0.7", "reason": "bad password"},
+//	    Data:     map[string]any{"src_ip": "10.0.0.7", "failure_reason": "bad_password"},
 //	})
 //	if err != nil { ... }
 //	err = wsc.Push(id, payload)
+//
+// Collectors that re-read a log (journald, Windows Event Log) should also set
+// EventID (from DeterministicID) and Time (the log record's own timestamp),
+// so a restart never creates duplicate or misdated events.
 //
 // Fields the server sets itself and this package must NOT send:
 // agent_id, tenant_id, ingest_source, created_at.
@@ -63,6 +67,17 @@ type Params struct {
 	Username string // optional
 	Metadata map[string]any
 	Data     map[string]any // class-specific fields; nil becomes {}
+
+	// EventID is optional. Leave it empty for a random UUID. Collectors that
+	// re-read a log (journald, Windows Event Log) set it from DeterministicID
+	// so the same source record always gets the same ID, and the server's
+	// idempotent insert absorbs any re-read after a restart. Must be a UUID.
+	EventID string
+
+	// Time is optional. Zero means "now". Collectors set it to the log
+	// record's own timestamp so a delayed or replayed record is dated when
+	// it happened, not when it was collected.
+	Time time.Time
 }
 
 // envelope mirrors schemas.ws.WSEvent. Keep field names in sync with it.
@@ -133,9 +148,25 @@ func clip(s string, n int) string {
 	return string(r[:n])
 }
 
-// Build returns a fresh event_id and the complete WSEvent JSON for it. Pass
+// idNamespace is a fixed namespace so DeterministicID is stable across
+// releases. Never change this string: doing so would change every ID.
+var idNamespace = uuid.NewSHA1(uuid.NameSpaceURL, []byte("khemstrix-edr/event-id/v1"))
+
+// DeterministicID returns the same UUID for the same parts, every time.
+// Collectors pass values that uniquely identify the source record, for
+// example (agentID, "journald", cursor) or (agentID, "windows-security", recordID).
+// Parts are joined with a NUL byte, so ("ab","c") and ("a","bc") differ.
+func DeterministicID(parts ...string) string {
+	return uuid.NewSHA1(idNamespace, []byte(strings.Join(parts, "\x00"))).String()
+}
+
+// Build returns the event_id and the complete WSEvent JSON for it. Pass
 // both straight to wsclient.Push: returning them together guarantees the
 // outbox key and the "event_id" inside the payload always match.
+//
+// The event_id is p.EventID if set (validated, returned in canonical
+// lower-case form), otherwise a fresh random UUID. The time is p.Time if
+// set, otherwise now; either way it is sent as UTC.
 func Build(p Params) (eventID string, payload []byte, err error) {
 	if p.ClassUID <= 0 || p.CategoryUID <= 0 {
 		return "", nil, fmt.Errorf("event: class_uid and category_uid are required (got %d, %d)", p.ClassUID, p.CategoryUID)
@@ -153,11 +184,25 @@ func Build(p Params) (eventID string, payload []byte, err error) {
 		data = map[string]any{} // server requires `data` to be an object, not null
 	}
 
-	eventID = uuid.NewString()
+	if p.EventID != "" {
+		u, perr := uuid.Parse(p.EventID)
+		if perr != nil {
+			return "", nil, fmt.Errorf("event: EventID %q is not a valid UUID: %w", p.EventID, perr)
+		}
+		eventID = u.String() // canonical lower-case form
+	} else {
+		eventID = uuid.NewString()
+	}
+
+	ts := p.Time
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
 	env := envelope{
 		Type:        "event",
 		EventID:     eventID,
-		Time:        time.Now().UTC().Format("2006-01-02T15:04:05.000000Z07:00"), // UTC, microseconds, trailing Z
+		Time:        ts.UTC().Format("2006-01-02T15:04:05.000000Z07:00"), // UTC, microseconds, trailing Z
 		ClassUID:    p.ClassUID,
 		CategoryUID: p.CategoryUID,
 		ActivityID:  p.ActivityID,
