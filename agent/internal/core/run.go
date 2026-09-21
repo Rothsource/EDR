@@ -136,6 +136,7 @@ func Run(ctx context.Context, flags config.Flags) error {
 			} else {
 				log.Printf("wsclient: starting, targeting %s", wsURL)
 				go wsc.Run(ctx)
+				go StartAuthCollector(ctx, cfg.AgentID, wsc)
 				go func() {
 					<-ctx.Done()
 					_ = st.Close()
