@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timezone
 from typing import Optional
 from uuid import UUID
 
@@ -7,6 +8,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+
 
 from db.database import get_db
 from db.models import Agent, Event
@@ -64,9 +66,12 @@ async def _authenticate(websocket: WebSocket, db: AsyncSession) -> Optional[Agen
 
 
 async def _handle_event(db: AsyncSession, websocket: WebSocket, msg: WSEvent, agent: Agent) -> None:
-    # Postgres column is TIMESTAMP WITHOUT TIME ZONE — asyncpg rejects
-    # tz-aware datetimes against it, so strip tzinfo here (values are UTC).
-    event_time = msg.time.replace(tzinfo=None) if msg.time.tzinfo else msg.time
+    # events.time is TIMESTAMP WITH TIME ZONE. Always hand asyncpg a tz-aware
+    # UTC datetime: a naive one would be interpreted as the server's LOCAL time.
+    if msg.time.tzinfo:
+        event_time = msg.time.astimezone(timezone.utc)
+    else:
+        event_time = msg.time.replace(tzinfo=timezone.utc)  # agents send UTC
 
     stmt = (
         pg_insert(Event)
@@ -84,6 +89,13 @@ async def _handle_event(db: AsyncSession, websocket: WebSocket, msg: WSEvent, ag
             tenant_id=agent.tenant_id,
             metadata_=msg.metadata,
             data=msg.data,
+            # Agent-supplied envelope fields (optional in WSEvent)
+            schema_version=msg.schema_version,
+            agent_version=msg.agent_version,
+            host_os=msg.host_os,
+            host_os_version=msg.host_os_version,
+            # Server-set, never taken from the client
+            ingest_source="websocket",
         )
         .on_conflict_do_nothing(index_elements=["event_id"])
     )

@@ -7,14 +7,12 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"khemstrix-agent/internal/config"
+	"khemstrix-agent/internal/event"
 	"khemstrix-agent/internal/store"
 	"khemstrix-agent/internal/wsclient"
 )
@@ -45,24 +43,24 @@ func main() {
 	// Give it a moment to connect + authenticate before pushing.
 	time.Sleep(2 * time.Second)
 
-	eventID := uuid.NewString()
-	payload := fmt.Sprintf(`{
-		"type":"event",
-		"event_id":"%s",
-		"time":"%s",
-		"class_uid":1001,
-		"category_uid":1,
-		"activity_id":1,
-		"type_uid":100101,
-		"severity_id":1,
-		"hostname":"testpush-harness",
-		"username":"test-user",
-		"metadata":{},
-		"data":{"note":"testpush harness"}
-	}`, eventID, time.Now().UTC().Format(time.RFC3339))
+	// event.Build stamps event_id, time, type_uid and the envelope fields
+	// (schema_version, agent_version, host_os, host_os_version). Hostname is
+	// overridden so the SQL in the test guide (WHERE hostname = 'testpush-harness') still matches.
+	eventID, payload, err := event.Build(event.Params{
+		ClassUID:    1001,
+		CategoryUID: 1,
+		ActivityID:  1,
+		SeverityID:  1,
+		Hostname:    "testpush-harness",
+		Username:    "test-user",
+		Data:        map[string]any{"note": "testpush harness"},
+	})
+	if err != nil {
+		log.Fatalf("building event: %v", err)
+	}
 
 	log.Printf("pushing test event %s", eventID)
-	if err := client.Push(eventID, []byte(payload)); err != nil {
+	if err := client.Push(eventID, payload); err != nil {
 		log.Fatalf("Push failed: %v", err)
 	}
 

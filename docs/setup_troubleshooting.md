@@ -36,6 +36,12 @@ Without `--host 0.0.0.0`, the server only accepts connections from
 `localhost` — a separate VM trying to connect will simply time out or
 refuse, with no useful error message pointing at this cause.
 
+**When testing WebSocket reconnection/reliability specifically (§3.6
+below), you will be repeatedly killing (Ctrl+C) and restarting this exact
+command.** Keep it in its own dedicated terminal window that you don't use
+for anything else, so "kill the server" is always just one focused Ctrl+C
+away rather than hunting through scrollback in a shared terminal.
+
 ### 1.2 Dashboard
 
 ```powershell
@@ -89,6 +95,19 @@ Running it:
 .\khemstrixAgent.exe --server=http://<server-ip>:8000 --token=<enrollment-token>
 ```
 
+**Building the WebSocket test harness tools** (`testpush`, `testreconnect`,
+`dumpoutbox` — see §3.6 and §3.7 below) follows the same pattern, one
+binary per `cmd/` subfolder:
+```powershell
+go build -o testpush.exe ./cmd/testpush
+go build -o testreconnect.exe ./cmd/testreconnect
+go build -o dumpoutbox.exe ./cmd/dumpoutbox
+```
+These are development tools only — they exist to exercise the outbox and
+WebSocket pipeline directly, without needing the full agent runtime or a
+real collector generating events. Keep them out of anything you'd ship to
+a customer.
+
 ### 1.4 Getting a fresh enrollment token
 
 Tokens are single-use and expire after 1 hour. Generate one via `/docs`
@@ -140,6 +159,11 @@ stored. After the first real write, confirm directly:
 ```sql
 SELECT hostname, ip_address, mac_address FROM agents ORDER BY created_at DESC LIMIT 1;
 ```
+The same rule applies to WebSocket event ingestion — a clean log line on
+the agent side proves a push was *attempted*, not that it landed. Confirm
+with `SELECT * FROM events ORDER BY created_at DESC LIMIT 5;` (or the
+`dumpoutbox.exe` tool, from the agent's side — see §3.7) rather than
+trusting console output alone.
 
 ### 2.3 A newly-added `PATCH`/`POST`/`DELETE` route returns `404`, even though the code looks right and the server restarted fine
 
@@ -215,6 +239,34 @@ heartbeats aren't actually landing).
 ```sql
 SELECT hostname, last_seen_at, NOW() FROM agents WHERE hostname = 'x';
 ```
+
+### 2.6 `dial tcp <ip>:8000: connectex: No connection could be made because the target machine actively refused it` vs. `context deadline exceeded` — these mean different things, don't treat them the same
+
+**Symptom:** a WebSocket/HTTP connection attempt from the agent fails, and
+the exact wording of the error matters for diagnosis:
+
+- **`context deadline exceeded` / `Client.Timeout exceeded while awaiting
+  headers`** — the network path is fine; a SYN reached *something*, but
+  nothing responded in time. Usually means: server process is running but
+  overloaded/hung, or you're pointed at an IP that's reachable but nothing
+  is listening on that specific port, or a firewall is silently dropping
+  packets (rather than rejecting them) somewhere along the path.
+- **`connectex: ... actively refused it`** — the opposite: the TCP
+  handshake completed and the target machine explicitly said "nothing is
+  listening here." This means the server process is **not running at
+  all** on that host/port right now. Don't go looking for a firewall or
+  network issue — go start (or restart) the server first.
+
+**Fix:** treat "actively refused" as your first and cheapest diagnostic
+step whenever a previously-working agent suddenly can't connect — before
+assuming a networking or firewall change, just confirm the server process
+is actually up:
+```powershell
+# on the server machine
+Get-Process | Where-Object { $_.ProcessName -like "*uvicorn*" -or $_.ProcessName -like "*python*" }
+```
+Only move on to VM/network diagnosis (§4.2) once you've confirmed the
+server process itself is genuinely running and bound correctly.
 
 ---
 
@@ -354,6 +406,12 @@ This preserves the agent's history in Postgres (same `agent_id`
 throughout) rather than creating a duplicate "new" agent, which a full
 uninstall-and-re-enroll would do instead.
 
+**If `Stop-Service`/`Restart-Service` can't find the service at all**
+(`Cannot find any service with service name 'khemstrix-agent'`), see §3.8
+below before assuming this fix doesn't apply to your situation — the
+service registration itself may be missing, which is a different, prior
+problem you need to resolve first.
+
 **Confirm the fix worked** — wait ~30–90s after restarting, then check:
 ```bash
 cat /etc/khemstrix-agent/state.json
@@ -430,6 +488,161 @@ GOOS=windows GOARCH=amd64 go build -o khemstrixAgent.exe ./cmd/agent
 GOOS=linux GOARCH=amd64 go build -o khemstrixAgent ./cmd/agent
 ```
 
+### 3.6 Testing WebSocket reliability: the actual step-by-step (durable
+delivery, reconnection, reconciliation, duplicate protection)
+
+This is the practical companion to the reliability *design* covered in
+`architecture.md` §4 — the concrete steps that actually exercise it,
+confirmed to work during real testing.
+
+**Single-event durable delivery + reconnect, minimal version:**
+1. Start the server normally (§1.1).
+2. Run `.\testpush.exe` — it registers/authenticates using the agent's
+   saved config, pushes one synthetic event, and watches for ~15 seconds
+   for an ack.
+3. Confirm it landed: `.\dumpoutbox.exe` should report `outbox is empty —
+   no unacked events remain`.
+
+**Testing an actual outage (the important one):**
+1. Run `.\testpush.exe` (or `.\testreconnect.exe`, which is built
+   specifically for this and prints an explicit prompt telling you when to
+   kill the server).
+2. **Kill the server** (Ctrl+C in its terminal) — do this *before* the
+   test tool's watch window closes.
+3. Confirm the event is stuck locally: `.\dumpoutbox.exe` should now show
+   `outbox has 1 row(s)` (or however many you pushed), each still at
+   `pending` or `sent_unacked` status.
+4. **Restart the server.**
+5. Wait a few seconds, then re-check: `.\dumpoutbox.exe` should now report
+   empty again — the agent reconnected on its own and the queued event(s)
+   reconciled without any manual restart of the agent itself.
+
+**Testing a larger backlog** (closer to a real extended outage than a
+single event):
+1. Kill the server.
+2. Fire off several pushes in a row while it's down:
+   ```powershell
+   for ($i=1; $i -le 15; $i++) { .\testpush.exe }
+   ```
+3. `.\dumpoutbox.exe` should show all of them queued.
+4. Restart the server, wait, re-check — should clear to empty.
+
+**Confirming duplicate protection actually held**, after any of the above:
+```sql
+SELECT event_id, COUNT(*) FROM events GROUP BY event_id HAVING COUNT(*) > 1;
+```
+Zero rows returned means no duplicates were created, even if an event was
+retried multiple times across a reconnect.
+
+**Testing multi-agent isolation:** run the same test tools from a second,
+independently registered agent (e.g. the Linux cross-compiled binary from
+§1.3, registered with its own enrollment token so it gets its own
+`agent_id`/`api_key`), and confirm in Postgres that each agent's events
+carry the correct, distinct `agent_id` with nothing crossed over:
+```sql
+SELECT event_id, agent_id, hostname, created_at
+FROM events
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+### 3.7 `dumpoutbox.exe`/reading `outbox.db` directly — don't trust a raw
+`Get-Content` on the `.db`/`.db-wal` files
+
+**Symptom:** you try to peek at the outbox without the `dumpoutbox` tool,
+e.g.:
+```powershell
+Get-Content C:\ProgramData\khemstrix-agent\outbox.db-wal | Select-String "pending|sent_unacked"
+```
+This *can* show readable JSON fragments (SQLite's WAL format is partially
+plain-text for TEXT columns), but it's unreliable while the agent process
+has the database open — SQLite in WAL mode keeps recent writes in the
+`-wal` file and only periodically checkpoints them into the main `.db`
+file, and a live connection can hold pages in a state that doesn't match
+what a naive text scan shows you. You may see stale rows that have
+actually already been deleted, or miss rows that exist but haven't been
+flushed to a place a text scan can see.
+
+**Fix:** use `dumpoutbox.exe` (or an equivalent that opens the DB properly
+through SQLite's own driver) instead of reading the raw file. If you don't
+have `sqlite3` installed and don't have a purpose-built dump tool either,
+a quick one-off in Python works too, since Python's standard library
+includes `sqlite3`:
+```powershell
+python -c "import sqlite3; c=sqlite3.connect(r'C:\ProgramData\khemstrix-agent\outbox.db'); print(c.execute('SELECT event_id, status FROM outbox').fetchall())"
+```
+Installing the SQLite CLI properly is worthwhile if you'll be checking
+this often:
+```powershell
+winget install SQLite.SQLite
+```
+
+### 3.8 Windows service for the agent (`khemstrix-agent`) intermittently
+can't be found by `Get-Service`/`Restart-Service`/`sc.exe`, even right
+after confirming it exists
+
+**Symptom:** `Get-Service *khemstrix*` returns the service, showing
+`Running` — but moments later, `Restart-Service khemstrix-agent` (or
+`sc.exe query khemstrix-agent`) reports `Cannot find any service with
+service name 'khemstrix-agent'`, and a subsequent `Get-Service *khemstrix*`
+now returns nothing at all. Nothing about the commands you ran should have
+removed it.
+
+**What this actually means:** if `Get-Process` also stops showing the
+agent process around the same time, the **process crashed or exited on
+its own** — check the System event log for the definitive answer before
+troubleshooting PowerShell syntax or permissions:
+```powershell
+Get-EventLog -LogName System -Source "Service Control Manager" -Newest 20 |
+  Where-Object { $_.Message -like "*khemstrix*" }
+```
+A line like `The Khemstrix EDR Agent service terminated unexpectedly`
+confirms the service really did stop running — this isn't a lookup/naming
+problem, the service is genuinely gone from the SCM until something
+restarts it.
+
+**Immediate workaround — run the executable directly instead of via the
+service**, while you investigate why the service died:
+```powershell
+& "C:\Program Files\khemstrix-agent\khemstrixAgent.exe"
+```
+This runs it in the foreground of your current terminal, which also has
+the benefit of showing you its logs directly rather than needing the
+Event Log — often enough on its own to reveal why it had been
+crashing as a service (e.g. a bad config value, a missing permission the
+service account didn't have but your interactive session does).
+
+**Root-causing the actual crash** is the real fix and is specific to
+whatever the agent's own error output says — this section only covers
+recognizing *that* it crashed rather than chasing a phantom
+"service not found" naming issue. Once you've identified and fixed the
+underlying cause, re-register the service (however your install script
+does this — typically an admin-elevated
+`khemstrixAgent.exe install`/`sc.exe create` step) rather than continuing
+to run it manually going forward.
+
+### 3.9 `wsclient: connection attempt ended: read failed: failed to get
+reader: use of closed network connection` right after a normal, successful
+test push
+
+**Symptom:** `testpush.exe` logs this immediately after `pushed —
+watching for ack/reconcile activity for 15s`, and it looks alarming, but
+`dumpoutbox.exe` confirms the event was actually delivered and acked (the
+outbox is empty afterward).
+
+**Cause:** this is very likely just the test tool's own WebSocket
+connection closing cleanly after its single test event is confirmed,
+logged at a level that makes it look like a failure rather than expected
+teardown. Confirmed non-fatal by checking the outbox immediately after —
+if it's empty, the event went through fine despite this log line.
+
+**When to actually worry:** if this message appears but `dumpoutbox.exe`
+still shows the event stuck at `pending`/`sent_unacked` afterward, *that*
+combination is a real problem worth digging into (the connection is dying
+before the ack round-trip completes, not just during cleanup after it).
+Always check the outbox state before deciding whether a log line like this
+is signal or noise.
+
 ---
 
 ## 4. Cross-Machine / VM Testing Problems
@@ -471,6 +684,9 @@ out
    adapter your VM software creates (e.g. a "VMnet" adapter), not your
    host's Wi-Fi/Ethernet IP. Check with `ipconfig` on the host and look for
    the adapter your hypervisor manages.
+4. Distinguish "actively refused" from "timed out" (§2.6) — they point at
+   different problems (server not running, vs. genuine network path
+   issue) and chasing the wrong one wastes time.
 
 ### 4.3 New Windows/Linux binary flagged by antivirus (e.g. VirusTotal
 shows a handful of detections)
@@ -586,13 +802,21 @@ silent failure is Notepad's typical behavior when Windows blocks the
 write due to permissions, rather than a file lock, which usually surfaces
 a more explicit "being used by another process" message.
 
+**If you also need to restart the agent afterward and it's registered as
+a Windows service rather than run manually,** see §3.8 above first if
+`Restart-Service`/`Stop-Service` can't find it — don't assume the service
+name is wrong before checking whether the process actually crashed.
+
 ---
 
 ## 7. General Debugging Habits Worth Keeping
 
 - **When in doubt about whether something was actually persisted, query
   Postgres directly.** `/docs` and API responses can look correct while
-  hiding a real gap in the ORM layer (see §2.2).
+  hiding a real gap in the ORM layer (see §2.2). The same applies to
+  WebSocket event delivery — `dumpoutbox.exe` reporting empty and a
+  `SELECT COUNT(*) FROM events` matching what you expect are the two real
+  sources of truth, not console log lines.
 - **Compare backend-reported timestamps against `NOW()` in the same
   query** when something's timing looks wrong — this immediately tells you
   whether the bug is in the backend (timestamp is genuinely stale) or in
@@ -628,3 +852,17 @@ a more explicit "being used by another process" message.
   always permissions, not corruption.** Check elevation first (§6.1)
   before assuming the file itself or the agent's config-parsing logic is
   broken.
+- **"Actively refused" and "timed out" are different diagnoses — don't
+  treat them as interchangeable network errors.** Refused means nothing is
+  listening (go check the server process); timed out means something
+  didn't respond in time (go check the network path or an overloaded
+  process). See §2.6.
+- **A service that "can't be found" moments after `Get-Service` showed it
+  running almost certainly crashed, not renamed itself.** Check the System
+  event log before assuming a PowerShell syntax or permissions issue —
+  see §3.8.
+- **When testing WebSocket reliability, always confirm the actual outcome
+  in the outbox and/or Postgres, never just the console log line.** A log
+  message that looks like an error (§3.9) can be harmless cleanup, and a
+  log message that looks successful can still leave an event stuck — the
+  outbox/database state is the only real signal.

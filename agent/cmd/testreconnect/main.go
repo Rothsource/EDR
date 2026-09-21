@@ -6,14 +6,12 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"khemstrix-agent/internal/config"
+	"khemstrix-agent/internal/event"
 	"khemstrix-agent/internal/store"
 	"khemstrix-agent/internal/wsclient"
 )
@@ -41,12 +39,23 @@ func main() {
 
 	time.Sleep(2 * time.Second)
 
-	eventID := uuid.NewString()
-	payload := fmt.Sprintf(`{"type":"event","event_id":"%s","time":"%s","class_uid":1001,"category_uid":1,"activity_id":1,"type_uid":100101,"severity_id":1,"hostname":"reconnect-test","username":"test-user","metadata":{},"data":{"note":"reconnect test"}}`,
-		eventID, time.Now().UTC().Format(time.RFC3339))
+	// Hostname is overridden so the SQL in the test guide
+	// (WHERE hostname = 'reconnect-test') still matches.
+	eventID, payload, err := event.Build(event.Params{
+		ClassUID:    1001,
+		CategoryUID: 1,
+		ActivityID:  1,
+		SeverityID:  1,
+		Hostname:    "reconnect-test",
+		Username:    "test-user",
+		Data:        map[string]any{"note": "reconnect test"},
+	})
+	if err != nil {
+		log.Fatalf("building event: %v", err)
+	}
 
 	log.Printf("pushing event %s — NOW GO KILL THE SERVER (Ctrl+C uvicorn)", eventID)
-	if err := client.Push(eventID, []byte(payload)); err != nil {
+	if err := client.Push(eventID, payload); err != nil {
 		log.Fatalf("Push failed: %v", err)
 	}
 

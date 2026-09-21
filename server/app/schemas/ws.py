@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from uuid import UUID
 from datetime import datetime
 from typing import Optional, Literal, Any
@@ -14,7 +14,8 @@ class WSAuth(BaseModel):
 class WSEvent(BaseModel):
     """Mirrors Event columns. event_id is agent-generated (idempotency key).
     agent_id/tenant_id are NOT included here — same rule as REST inserts,
-    they're stamped server-side from the authenticated connection."""
+    they're stamped server-side from the authenticated connection.
+    ingest_source is likewise NOT included: the server sets it, never the client."""
     type: Literal["event"] = "event"
     event_id: UUID
     time: datetime
@@ -27,6 +28,15 @@ class WSEvent(BaseModel):
     username: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
     data: dict[str, Any]
+
+    # Envelope fields added Sept 18. All optional so older agents that don't
+    # send them still validate. Bounds matter: events.schema_version is a
+    # smallint, and an out-of-range value would raise a DB error inside
+    # _handle_event (uncaught) instead of a clean validation error here.
+    schema_version: int = Field(default=1, ge=1, le=32767)
+    agent_version: Optional[str] = Field(default=None, max_length=64)
+    host_os: Optional[str] = Field(default=None, max_length=32)  # plain str, not an enum: new OSes shouldn't strand events
+    host_os_version: Optional[str] = Field(default=None, max_length=128)
 
 
 class WSAck(BaseModel):
