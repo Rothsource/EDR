@@ -1,37 +1,58 @@
-import { createContext, useContext, useState, useCallback } from "react";
-import { api, getToken, setToken, clearToken } from "../api";
+import React, { createContext, useContext, useState, useEffect } from "react";
+import { api, getToken, setToken, clearToken, AuthError } from "../api";
 
 const AuthContext = createContext(null);
 
-export function AuthProvider({ children }) {
-  const [isAuthenticated, setIsAuthenticated] = useState(!!getToken());
+export const AuthProvider = ({ children }) => {
+  const [token, setAuthTokenState] = useState(getToken());
+  const [user, setUser] = useState({
+    username: localStorage.getItem("edr_username") || "admin",
+    tenant: "00000000-0000-0000-0000-000000000001",
+  });
 
-  const login = useCallback(async (username, password) => {
-    const data = await api.login(username, password);
-    setToken(data.access_token);
-    setIsAuthenticated(true);
+  useEffect(() => {
+    const currentToken = getToken();
+    setAuthTokenState(currentToken);
   }, []);
 
-  const logout = useCallback(() => {
-    // Stateless JWT — logout is purely a client-side action.
-    // There is nothing to tell the server; the token just gets discarded.
+  const login = async (username, password) => {
+    try {
+      const data = await api.login(username, password);
+      if (data && data.access_token) {
+        setToken(data.access_token);
+        localStorage.setItem("edr_username", username);
+        setAuthTokenState(data.access_token);
+        setUser((prev) => ({ ...prev, username }));
+        return true;
+      }
+    } catch (err) {
+      if (err instanceof AuthError) {
+        throw new Error("Invalid username or password");
+      }
+      throw err;
+    }
+    return false;
+  };
+
+  const logout = () => {
     clearToken();
-    setIsAuthenticated(false);
-  }, []);
-
-  // Called by pages when an API call throws AuthError (expired/invalid token).
-  const forceLogout = useCallback(() => {
-    clearToken();
-    setIsAuthenticated(false);
-  }, []);
+    localStorage.removeItem("edr_username");
+    setAuthTokenState(null);
+  };
 
   return (
-    <AuthContext.Provider value={{ isAuthenticated, login, logout, forceLogout }}>
+    <AuthContext.Provider
+      value={{
+        token,
+        user,
+        login,
+        logout,
+        isAuthenticated: !!token,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
-}
+};
 
-export function useAuth() {
-  return useContext(AuthContext);
-}
+export const useAuth = () => useContext(AuthContext);

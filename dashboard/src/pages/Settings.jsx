@@ -1,139 +1,148 @@
-import { useState } from "react";
-import { api, AuthError } from "../api";
+import React, { useState } from "react";
+import { PageHeader } from "../components/PageHeader";
 import { useAuth } from "../context/AuthContext";
-import AppShell from "../components/AppShell";
-import PageHeader from "../components/PageHeader";
+import { Lock, CheckCircle2 } from "lucide-react";
+import { api } from "../api";
 
-export default function Settings() {
-  const { forceLogout } = useAuth();
-
+export const Settings = () => {
+  const { user } = useAuth();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [showCurrent, setShowCurrent] = useState(false);
-  const [showNew, setShowNew] = useState(false);
-
-  const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
   const [loading, setLoading] = useState(false);
 
-  async function handleSubmit(e) {
+  const handlePasswordChange = async (e) => {
     e.preventDefault();
-    setError("");
-    setSuccess("");
+    setSuccessMessage("");
+    setErrorMessage("");
 
     if (newPassword !== confirmPassword) {
-      setError("New password and confirmation do not match.");
+      setErrorMessage("New passwords do not match.");
       return;
     }
 
     setLoading(true);
     try {
       await api.changePassword(currentPassword, newPassword);
-      setSuccess("Password updated successfully.");
+      setSuccessMessage("Password updated successfully.");
       setCurrentPassword("");
       setNewPassword("");
       setConfirmPassword("");
     } catch (err) {
-      if (err instanceof AuthError) {
-        forceLogout();
-        return;
-      }
-      setError(err.message);
+      setErrorMessage(err.message || "Failed to update password");
     } finally {
       setLoading(false);
     }
-  }
+  };
 
   return (
-    <AppShell>
-      <PageHeader title="Settings" subtitle="Manage your admin account" />
+    <div>
+      <PageHeader
+        title="Settings & Security"
+        description="Manage admin credentials and node security parameters."
+      />
 
-      <div className="max-w-lg bg-surface rounded-xl shadow-sm border border-outline-variant p-6">
-        <h2 className="text-sm font-semibold text-on-surface mb-1 flex items-center gap-2">
-          <span className="material-symbols-outlined text-[18px] text-primary">lock_reset</span>
-          Change Password
-        </h2>
-        <p className="text-sm text-on-surface-variant mb-4">
-          You'll need your current password to set a new one.
-        </p>
-
-        {success && (
-          <div className="mb-4 p-3 rounded-lg bg-success-container text-success text-sm flex items-center gap-2">
-            <span className="material-symbols-outlined text-[16px]">check_circle</span>
-            {success}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 h-fit">
+          <div className="flex items-center gap-3.5 mb-6 pb-6 border-b border-slate-800">
+            <div className="h-12 w-12 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 font-bold text-lg">
+              {user?.username?.substring(0, 2).toUpperCase() || "AD"}
+            </div>
+            <div>
+              <h3 className="font-semibold text-slate-100">{user?.username || "Administrator"}</h3>
+              <p className="text-xs text-indigo-400 font-mono mt-0.5">SuperAdministrator</p>
+            </div>
           </div>
-        )}
-        {error && (
-          <div className="mb-4 p-3 rounded-lg bg-error-container text-on-error-container text-sm flex items-center gap-2">
-            <span className="material-symbols-outlined text-[16px]">error</span>
-            {error}
+
+          <div className="space-y-3 text-sm">
+            <div className="flex items-center justify-between py-2 border-b border-slate-800/60">
+              <span className="text-slate-400">Tenant ID</span>
+              <span className="text-slate-200 font-mono text-xs">00000000-0000-0000-0000-000000000001</span>
+            </div>
+            <div className="flex items-center justify-between py-2 border-b border-slate-800/60">
+              <span className="text-slate-400">Auth Scheme</span>
+              <span className="text-slate-200 font-mono text-xs">JWT (HS256)</span>
+            </div>
+            <div className="flex items-center justify-between py-2">
+              <span className="text-slate-400">Deployment</span>
+              <span className="text-emerald-400 font-medium text-xs">On-Premise SME</span>
+            </div>
           </div>
-        )}
+        </div>
 
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <PasswordField
-            label="Current Password"
-            value={currentPassword}
-            onChange={setCurrentPassword}
-            show={showCurrent}
-            onToggleShow={() => setShowCurrent((v) => !v)}
-          />
-          <PasswordField
-            label="New Password"
-            value={newPassword}
-            onChange={setNewPassword}
-            show={showNew}
-            onToggleShow={() => setShowNew((v) => !v)}
-          />
-          <PasswordField
-            label="Confirm New Password"
-            value={confirmPassword}
-            onChange={setConfirmPassword}
-            show={showNew}
-            onToggleShow={() => setShowNew((v) => !v)}
-          />
+        <div className="lg:col-span-2 bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+          <div className="flex items-center gap-3 mb-6 pb-4 border-b border-slate-800">
+            <div className="h-9 w-9 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+              <Lock className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-semibold text-slate-100">Change Admin Password</h3>
+              <p className="text-xs text-slate-400">Requires current password verification</p>
+            </div>
+          </div>
 
-          <div className="flex justify-end mt-2">
+          {successMessage && (
+            <div className="mb-6 p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-emerald-400 text-sm flex items-center gap-2.5">
+              <CheckCircle2 className="h-5 w-5 shrink-0" />
+              {successMessage}
+            </div>
+          )}
+
+          {errorMessage && (
+            <div className="mb-6 p-4 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm">
+              {errorMessage}
+            </div>
+          )}
+
+          <form onSubmit={handlePasswordChange} className="space-y-5">
+            <div>
+              <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Current Password</label>
+              <input
+                type="password"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
+                placeholder="••••••••"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">New Password</label>
+              <input
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
+                placeholder="••••••••"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Confirm New Password</label>
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
+                placeholder="••••••••"
+              />
+            </div>
+
             <button
               type="submit"
               disabled={loading}
-              className="h-9 px-4 rounded-lg bg-primary text-on-primary text-sm font-medium hover:opacity-95 transition disabled:opacity-60"
+              className="px-6 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors shadow-lg shadow-indigo-600/20"
             >
-              {loading ? "Updating…" : "Update Password"}
+              {loading ? "Updating..." : "Update Password"}
             </button>
-          </div>
-        </form>
-      </div>
-    </AppShell>
-  );
-}
-
-function PasswordField({ label, value, onChange, show, onToggleShow }) {
-  return (
-    <div className="flex flex-col gap-1">
-      <label className="text-sm font-medium text-on-surface">{label}</label>
-      <div className="relative flex items-center">
-        <span className="material-symbols-outlined absolute left-3 text-outline text-[18px]">
-          lock
-        </span>
-        <input
-          type={show ? "text" : "password"}
-          required
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-full h-10 pl-10 pr-10 rounded-lg bg-surface-container-low text-sm outline-none focus:ring-2 focus:ring-primary/40 transition"
-        />
-        <button
-          type="button"
-          onClick={onToggleShow}
-          className="absolute right-2 p-1 text-outline hover:text-on-surface rounded"
-        >
-          <span className="material-symbols-outlined text-[18px]">
-            {show ? "visibility_off" : "visibility"}
-          </span>
-        </button>
+          </form>
+        </div>
       </div>
     </div>
   );
-}
+};

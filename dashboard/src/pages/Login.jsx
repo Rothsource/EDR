@@ -1,121 +1,85 @@
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { useAuth } from "../context/AuthContext";
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { Shield, Lock, User, ArrowRight } from 'lucide-react';
 
-export default function Login() {
+export const Login = () => {
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('password');
+  const [error, setError] = useState('');
   const { login } = useAuth();
   const navigate = useNavigate();
 
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  async function handleSubmit(e) {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    setError("");
-    setLoading(true);
-    try {
-      await login(username, password);
-      navigate("/");
-    } catch (err) {
-      // Backend intentionally returns the same generic message whether the
-      // username or the password was wrong — we just surface it as-is.
-      setError(err.message || "Invalid credentials.");
-    } finally {
-      setLoading(false);
+    setError('');
+    const success = await login(username, password);
+    if (success) {
+      navigate('/');
+    } else {
+      setError('Invalid credentials or backend unreachable');
     }
-  }
+  };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background p-4">
-      <div className="w-full max-w-md bg-surface rounded-xl shadow-md p-8">
-        <div className="flex items-center gap-3 mb-6">
-          <div className="w-10 h-10 rounded-lg bg-primary flex items-center justify-center text-on-primary shadow-sm">
-            <span className="material-symbols-outlined text-[24px]">shield_person</span>
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+      <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-8 shadow-2xl relative overflow-hidden">
+        <div className="absolute -top-24 -right-24 w-48 h-48 bg-indigo-600/20 rounded-full blur-3xl pointer-events-none" />
+
+        <div className="text-center mb-8">
+          <div className="inline-flex h-14 w-14 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 items-center justify-center text-indigo-400 mb-4 shadow-lg shadow-indigo-600/20">
+            <Shield className="h-7 w-7" />
           </div>
-          <div>
-            <div className="flex items-baseline gap-1.5">
-              <span className="font-bold text-lg text-on-surface">EDR</span>
-              <span className="font-medium text-lg text-on-surface-variant">Console</span>
-            </div>
-            <p className="text-xs text-on-surface-variant">
-              Internal endpoint monitoring — admin access
-            </p>
-          </div>
+          <h1 className="text-2xl font-bold text-slate-100 tracking-tight">KhemStrix EDR</h1>
+          <p className="text-sm text-slate-400 mt-1">Sovereign Enterprise Security Console</p>
         </div>
 
         {error && (
-          <div className="mb-4 flex items-start gap-2 p-3 rounded-lg bg-error-container text-on-error-container">
-            <span className="material-symbols-outlined text-[18px] mt-0.5 text-error shrink-0">
-              error
-            </span>
-            <p className="text-sm leading-snug">{error}</p>
+          <div className="mb-6 p-3.5 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm text-center">
+            {error}
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <div className="flex flex-col gap-1">
-            <label htmlFor="username" className="text-sm font-medium text-on-surface">
-              Username
-            </label>
-            <div className="relative flex items-center">
-              <span className="material-symbols-outlined absolute left-3 text-outline text-[20px]">
-                person
-              </span>
+        <form onSubmit={handleSubmit} className="space-y-5">
+          <div>
+            <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Username</label>
+            <div className="relative">
+              <User className="absolute left-3.5 top-3.5 h-4 w-4 text-slate-500" />
               <input
-                id="username"
                 type="text"
-                required
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                className="w-full h-10 pl-10 pr-3 rounded-lg bg-surface-container-low text-on-surface text-sm outline-none focus:ring-2 focus:ring-primary/40 transition"
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
                 placeholder="admin"
               />
             </div>
           </div>
 
-          <div className="flex flex-col gap-1">
-            <label htmlFor="password" className="text-sm font-medium text-on-surface">
-              Password
-            </label>
-            <div className="relative flex items-center">
-              <span className="material-symbols-outlined absolute left-3 text-outline text-[20px]">
-                lock
-              </span>
+          <div>
+            <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Password</label>
+            <div className="relative">
+              <Lock className="absolute left-3.5 top-3.5 h-4 w-4 text-slate-500" />
               <input
-                id="password"
-                type={showPassword ? "text" : "password"}
-                required
+                type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full h-10 pl-10 pr-10 rounded-lg bg-surface-container-low text-on-surface text-sm outline-none focus:ring-2 focus:ring-primary/40 transition"
-                placeholder="••••••••••••"
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-3 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors"
+                placeholder="••••••••"
               />
-              <button
-                type="button"
-                aria-label="Toggle password visibility"
-                onClick={() => setShowPassword((v) => !v)}
-                className="absolute right-2 p-1 text-outline hover:text-on-surface rounded"
-              >
-                <span className="material-symbols-outlined text-[20px]">
-                  {showPassword ? "visibility_off" : "visibility"}
-                </span>
-              </button>
             </div>
           </div>
 
           <button
             type="submit"
-            disabled={loading}
-            className="mt-2 w-full h-10 rounded-lg bg-primary text-on-primary text-sm font-medium flex items-center justify-center gap-2 shadow-sm hover:opacity-95 active:scale-[0.99] transition disabled:opacity-60"
+            className="w-full flex items-center justify-center gap-2 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold transition-colors shadow-lg shadow-indigo-600/25"
           >
-            {loading ? "Logging in…" : "Log in"}
-            {!loading && <span className="material-symbols-outlined text-[18px]">arrow_forward</span>}
+            Sign In to Console
+            <ArrowRight className="h-4 w-4" />
           </button>
         </form>
       </div>
     </div>
   );
-}
+};

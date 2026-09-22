@@ -1,6 +1,4 @@
 // Central place for every call to your FastAPI backend.
-// Base URL comes from .env (VITE_API_URL) so it's easy to point at
-// a different machine on your local network without touching code.
 export const API_URL = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000`;
 
 const TOKEN_KEY = "edr_access_token";
@@ -18,7 +16,6 @@ export function clearToken() {
 }
 
 // Thrown when the backend says the token is missing/invalid/expired.
-// Components can catch this specifically to redirect to /login.
 export class AuthError extends Error {}
 
 async function request(path, { method = "GET", body, auth = true } = {}) {
@@ -35,7 +32,6 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  // Parse JSON if there is any body, otherwise null.
   let data = null;
   const text = await res.text();
   if (text) {
@@ -81,4 +77,13 @@ export const api = {
 
   deleteAgent: (agentId) =>
     request(`/admin/agents/${agentId}`, { method: "DELETE" }),
+
+  listEvents: (params = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") qs.set(k, v);
+    });
+    const suffix = qs.toString();
+    return request(`/events${suffix ? `?${suffix}` : ""}`);
+  },
 };
