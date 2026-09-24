@@ -1,15 +1,78 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { PageHeader } from "../components/PageHeader";
 import { GenerateTokenModal } from "../components/GenerateTokenModal";
-import { Monitor, Plus, Trash2, ShieldAlert, ShieldCheck, RefreshCw } from "lucide-react";
+import {
+  Monitor,
+  Plus,
+  Trash2,
+  ShieldAlert,
+  ShieldCheck,
+  RefreshCw,
+  Search,
+  Terminal,
+} from "lucide-react";
 import { api } from "../api";
 import { getAgentState, relativeTime, formatDate } from "../agentStatus";
+
+// One-line platform label from the raw OS string + version, e.g.
+// "Windows · 22H2 (build 19045.6456)" or "Linux · Kali Rolling".
+// Falls back gracefully when a piece is missing.
+const formatPlatform = (os, osVersion) => {
+  if (!osVersion) return null;
+  return osVersion;
+};
+
+const OS_ICON_CLASS = {
+  windows: "text-sky-400",
+  linux: "text-amber-400",
+};
+
+const StatPill = ({ label, value, tone }) => (
+  <div className="flex items-baseline gap-2 px-4 py-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+    <span className={`text-xl font-semibold ${tone}`}>{value}</span>
+    <span className="text-xs text-slate-400">{label}</span>
+  </div>
+);
+
+const StatusBadge = ({ state }) => (
+  <span
+    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
+      state === "online"
+        ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+        : state === "revoked"
+        ? "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+        : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+    }`}
+  >
+    <span
+      className={`h-1.5 w-1.5 rounded-full ${
+        state === "online"
+          ? "bg-emerald-400 animate-pulse"
+          : state === "revoked"
+          ? "bg-rose-400"
+          : "bg-amber-400"
+      }`}
+    />
+    {state.toUpperCase()}
+  </span>
+);
+
+const TableSkeletonRow = () => (
+  <tr className="animate-pulse">
+    {Array.from({ length: 7 }).map((_, i) => (
+      <td key={i} className="py-4 px-6">
+        <div className="h-3.5 bg-slate-800 rounded w-3/4" />
+      </td>
+    ))}
+  </tr>
+);
 
 export const Agents = () => {
   const [isTokenModalOpen, setIsTokenModalOpen] = useState(false);
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [query, setQuery] = useState("");
 
   const loadAgents = async () => {
     setLoading(true);
@@ -51,6 +114,25 @@ export const Agents = () => {
     }
   };
 
+  const counts = useMemo(() => {
+    const c = { online: 0, offline: 0, revoked: 0 };
+    for (const agent of agents) {
+      const state = getAgentState(agent);
+      if (c[state] !== undefined) c[state] += 1;
+    }
+    return c;
+  }, [agents]);
+
+  const filteredAgents = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return agents;
+    return agents.filter((agent) =>
+      [agent.hostname, agent.os, agent.os_version, agent.ip_address, agent.agent_id]
+        .filter(Boolean)
+        .some((field) => String(field).toLowerCase().includes(q))
+    );
+  }, [agents, query]);
+
   return (
     <div>
       <PageHeader
@@ -82,18 +164,42 @@ export const Agents = () => {
         </div>
       )}
 
+      {/* Fleet summary — quick read on health before scanning the table */}
+      <div className="flex flex-wrap gap-3 mb-6">
+        <StatPill label="Online" value={counts.online} tone="text-emerald-400" />
+        <StatPill label="Offline" value={counts.offline} tone="text-amber-400" />
+        <StatPill label="Revoked" value={counts.revoked} tone="text-rose-400" />
+        <StatPill label="Total enrolled" value={agents.length} tone="text-slate-100" />
+      </div>
+
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl overflow-hidden backdrop-blur-sm">
-        <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
-          <h3 className="text-base font-semibold text-slate-100">Enrolled Endpoints ({agents.length})</h3>
-          <span className="text-xs text-slate-400 font-mono">Live PostgreSQL Records</span>
+        <div className="px-6 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-base font-semibold text-slate-100">
+            Enrolled Endpoints ({filteredAgents.length}
+            {filteredAgents.length !== agents.length ? ` of ${agents.length}` : ""})
+          </h3>
+
+          <div className="flex items-center gap-3">
+            <div className="relative">
+              <Search className="h-3.5 w-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search hostname, OS, IP…"
+                className="pl-8 pr-3 py-1.5 bg-slate-950/60 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 w-56"
+              />
+            </div>
+            <span className="text-xs text-slate-400 font-mono">Live PostgreSQL Records</span>
+          </div>
         </div>
 
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-800 bg-slate-950/40 text-xs font-medium text-slate-400 uppercase tracking-wider">
-                <th className="py-3.5 px-6">Hostname</th>
-                <th className="py-3.5 px-6">OS</th>
+                <th className="py-3.5 px-6">Endpoint</th>
+                <th className="py-3.5 px-6">Platform</th>
                 <th className="py-3.5 px-6">Agent ID</th>
                 <th className="py-3.5 px-6">IP Address</th>
                 <th className="py-3.5 px-6">Status</th>
@@ -102,25 +208,51 @@ export const Agents = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/80 text-sm text-slate-300">
-              {agents.length === 0 && !loading ? (
+              {loading ? (
+                Array.from({ length: 4 }).map((_, i) => <TableSkeletonRow key={i} />)
+              ) : filteredAgents.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="py-8 text-center text-slate-500 text-sm">
-                    No agents enrolled yet. Click "Generate Enrollment Token" to register your first endpoint.
+                  <td colSpan="7" className="py-10 text-center text-slate-500 text-sm">
+                    {agents.length === 0 ? (
+                      <>
+                        No agents enrolled yet. Click "Generate Enrollment Token" to register your
+                        first endpoint.
+                      </>
+                    ) : (
+                      <>No endpoints match "{query}".</>
+                    )}
                   </td>
                 </tr>
               ) : (
-                agents.map((agent) => {
+                filteredAgents.map((agent) => {
                   const state = getAgentState(agent);
+                  const osKey = (agent.os || "").toLowerCase();
+                  const platformLabel = formatPlatform(agent.os, agent.os_version);
                   return (
                     <tr key={agent.agent_id} className="hover:bg-slate-800/40 transition-colors">
-                      <td className="py-4 px-6 font-semibold text-slate-100 flex items-center gap-2.5">
-                        <Monitor className="h-4 w-4 text-indigo-400 shrink-0" />
-                        {agent.hostname}
+                      <td className="py-4 px-6 font-semibold text-slate-100">
+                        <div className="flex items-center gap-2.5">
+                          <Monitor className="h-4 w-4 text-indigo-400 shrink-0" />
+                          {agent.hostname}
+                        </div>
                       </td>
                       <td className="py-4 px-6">
-                        <span className="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono uppercase">
-                          {agent.os}
-                        </span>
+                        <div className="flex flex-col gap-1">
+                          <span
+                            className={`inline-flex w-fit items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-slate-800 font-mono uppercase ${
+                              OS_ICON_CLASS[osKey] || "text-slate-300"
+                            }`}
+                          >
+                            <Terminal className="h-3 w-3" />
+                            {agent.os}
+                          </span>
+                          <span
+                            className="text-xs text-slate-500 truncate max-w-[220px]"
+                            title={platformLabel || undefined}
+                          >
+                            {platformLabel || "Version unknown — no events reported yet"}
+                          </span>
+                        </div>
                       </td>
                       <td
                         className="py-4 px-6 font-mono text-xs text-slate-400 truncate max-w-[140px]"
@@ -132,26 +264,7 @@ export const Agents = () => {
                         {agent.ip_address || "—"}
                       </td>
                       <td className="py-4 px-6">
-                        <span
-                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
-                            state === "online"
-                              ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                              : state === "revoked"
-                              ? "bg-rose-500/10 text-rose-400 border border-rose-500/20"
-                              : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                          }`}
-                        >
-                          <span
-                            className={`h-1.5 w-1.5 rounded-full ${
-                              state === "online"
-                                ? "bg-emerald-400 animate-pulse"
-                                : state === "revoked"
-                                ? "bg-rose-400"
-                                : "bg-amber-400"
-                            }`}
-                          />
-                          {state.toUpperCase()}
-                        </span>
+                        <StatusBadge state={state} />
                       </td>
                       <td className="py-4 px-6 text-xs text-slate-400" title={formatDate(agent.last_seen_at)}>
                         {relativeTime(agent.last_seen_at)}

@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package core
 
@@ -8,6 +8,12 @@ import (
 	"khemstrix-agent/internal/wsclient"
 )
 
-// No-op until parser_windows.go (Step 6) exists.
-func StartAuthCollector(ctx context.Context, agentID string, wsc *wsclient.Client) {
+var AuthConfigPath = ""
+
+type AuthCollectorHandle struct{}
+
+func (h *AuthCollectorHandle) Reload() {}
+
+func StartAuthCollector(ctx context.Context, agentID string, wsc *wsclient.Client) *AuthCollectorHandle {
+	return &AuthCollectorHandle{}
 }

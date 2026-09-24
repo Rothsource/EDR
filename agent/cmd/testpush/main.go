@@ -22,7 +22,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("no config found — register the agent first: %v", err)
 	}
-	log.Printf("DEBUG agent_id=%q api_key=%q server=%q", cfg.AgentID, cfg.APIKey, cfg.Server)
+	// Do not log cfg.APIKey — it's a live credential and this harness's
+	// output has ended up in terminal scrollback/log files before.
+	log.Printf("DEBUG agent_id=%q server=%q", cfg.AgentID, cfg.Server)
 
 	st, err := store.Open()
 	if err != nil {

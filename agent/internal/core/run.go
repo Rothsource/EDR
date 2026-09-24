@@ -3,10 +3,12 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -77,6 +79,74 @@ func buildWSURL(server string) (string, error) {
 	return u.String(), nil
 }
 
+// readLocalConfigVersion reads the "version" field already saved in the
+// module config file, so the agent doesn't fetch a config it already has
+// on first heartbeat after a restart. Missing/unreadable/malformed file
+// all safely resolve to 0, which just means "fetch on next mismatch."
+func readLocalConfigVersion(path string) int {
+	if path == "" {
+		return 0
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var v struct {
+		Version int `json:"version"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return 0
+	}
+	return v.Version
+}
+
+// atomicWriteFile matches the write-tmp/Sync/rename pattern already used
+// by saveCursor (Linux) and saveBookmarkXML (Windows) elsewhere in the
+// agent, so a config push can never leave a half-written file on disk.
+func atomicWriteFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// applyConfigUpdate fetches the resolved config for this agent, writes it
+// atomically, and signals the auth collector to reload — without ever
+// restarting the agent process itself (Section 7B.1).
+func applyConfigUpdate(cfg *config.Config, newVersion int, localVersion *int, handle *AuthCollectorHandle) {
+	body, err := FetchConfig(cfg.Server, cfg.AgentID, cfg.APIKey)
+	if err != nil {
+		log.Printf("config: fetch failed, will retry next heartbeat: %v", err)
+		return
+	}
+	if err := atomicWriteFile(AuthConfigPath, body); err != nil {
+		log.Printf("config: write failed, will retry next heartbeat: %v", err)
+		return
+	}
+	old := *localVersion
+	*localVersion = newVersion
+	log.Printf("config: applied v%d -> v%d", old, newVersion)
+	if handle != nil {
+		handle.Reload()
+	}
+}
+
 func Run(ctx context.Context, flags config.Flags) error {
 	cfg, err := config.Load()
 
@@ -120,6 +190,11 @@ func Run(ctx context.Context, flags config.Flags) error {
 	// it — heartbeat still owns liveness/IP-MAC refresh over REST; the
 	// WS client owns event delivery. A failure here is logged, not fatal:
 	// the agent should keep doing heartbeats even if streaming can't start.
+	//
+	// authHandle stays nil unless the auth collector actually starts; the
+	// heartbeat loop below checks for nil before calling Reload() on it.
+	var authHandle *AuthCollectorHandle
+
 	st, err := store.Open()
 	if err != nil {
 		log.Printf("wsclient: could not open durable outbox, event streaming disabled this run: %v", err)
@@ -136,7 +211,7 @@ func Run(ctx context.Context, flags config.Flags) error {
 			} else {
 				log.Printf("wsclient: starting, targeting %s", wsURL)
 				go wsc.Run(ctx)
-				go StartAuthCollector(ctx, cfg.AgentID, wsc)
+				authHandle = StartAuthCollector(ctx, cfg.AgentID, wsc)
 				go func() {
 					<-ctx.Done()
 					_ = st.Close()
@@ -148,9 +223,14 @@ func Run(ctx context.Context, flags config.Flags) error {
 		}
 	}
 
+	// localConfigVersion tracks the module config version this agent last
+	// applied. Seeded from whatever's already on disk so a restart doesn't
+	// re-fetch a config it already has.
+	localConfigVersion := readLocalConfigVersion(AuthConfigPath)
+
 	sendHeartbeat := func() {
 		netInfo := GetPrimaryInterface()
-		err := Heartbeat(cfg.Server, HeartbeatRequest{
+		resp, err := Heartbeat(cfg.Server, HeartbeatRequest{
 			AgentID:    cfg.AgentID,
 			APIKey:     cfg.APIKey,
 			IPAddress:  netInfo.IPAddress,
@@ -168,10 +248,19 @@ func Run(ctx context.Context, flags config.Flags) error {
 				LastSuccessAt: lastSuccess,
 				LastError:     err.Error(),
 			})
-		} else {
-			_ = config.SaveState(config.State{
-				LastSuccessAt: time.Now().UTC().Format(time.RFC3339),
-			})
+			return
+		}
+
+		_ = config.SaveState(config.State{
+			LastSuccessAt: time.Now().UTC().Format(time.RFC3339),
+		})
+
+		// Section 7B.1 step 1: compare the version the server just
+		// returned against what we last applied. AuthConfigPath is ""
+		// on platforms without a collector yet (authcollector_other.go),
+		// which disables this path entirely there.
+		if AuthConfigPath != "" && resp.ConfigVersion != localConfigVersion {
+			applyConfigUpdate(cfg, resp.ConfigVersion, &localConfigVersion, authHandle)
 		}
 	}
 

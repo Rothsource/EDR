@@ -1,19 +1,19 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { PageHeader } from "../components/PageHeader";
-import { 
-  Search, 
-  RefreshCw, 
-  AlertCircle, 
-  X, 
-  Terminal, 
-  Copy, 
-  Check, 
-  Radio, 
-  ArrowUpDown, 
-  ChevronUp, 
-  ChevronDown, 
-  ChevronLeft, 
-  ChevronRight, 
+import {
+  Search,
+  RefreshCw,
+  AlertCircle,
+  X,
+  Terminal,
+  Copy,
+  Check,
+  Radio,
+  ArrowUpDown,
+  ChevronUp,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   ExternalLink,
   Filter
 } from "lucide-react";
@@ -31,6 +31,15 @@ function relativeTime(isoString) {
   const diffHr = Math.floor(diffMin / 60);
   if (diffHr < 24) return `${diffHr}h ago`;
   return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+// A row can carry a real `reason` (set only for Linux events and Windows
+// 4625 failed logons) or, for every other Windows event, just an `event`
+// label (account_created, group_member_added, etc). This picks whichever
+// exists so the UI never shows a bare "—" when there's a perfectly good
+// event label to show instead.
+function displayReason(data) {
+  return data?.reason || data?.event || null;
 }
 
 // Syntax-highlighted OCSF JSON renderer
@@ -63,7 +72,7 @@ function SyntaxHighlightedJSON({ jsonString }) {
   }, [jsonString]);
 
   return (
-    <pre 
+    <pre
       className="font-mono text-xs leading-relaxed text-slate-200 overflow-x-auto whitespace-pre-wrap select-text"
       dangerouslySetInnerHTML={{ __html: formatted }}
     />
@@ -109,6 +118,24 @@ function FieldCopyPill({ label, value, onFilterSelect }) {
   );
 }
 
+// Success/failure status pill, driven by data.status (set by the server decoder)
+function StatusPill({ status }) {
+  if (!status) return <span className="text-slate-500 text-[11px]">—</span>;
+  const isSuccess = status === "success";
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold border ${
+        isSuccess
+          ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+          : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+      }`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${isSuccess ? "bg-emerald-400" : "bg-rose-400"}`} />
+      {isSuccess ? "Success" : "Failure"}
+    </span>
+  );
+}
+
 export const Events = () => {
   const [events, setEvents] = useState([]);
   const [pendingEvents, setPendingEvents] = useState([]);
@@ -119,6 +146,7 @@ export const Events = () => {
   const [filterOS, setFilterOS] = useState("all");
   const [filterReason, setFilterReason] = useState("all");
   const [filterService, setFilterService] = useState("all");
+  const [filterStatus, setFilterStatus] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
 
   // Live Auto-Refresh State
@@ -129,7 +157,11 @@ export const Events = () => {
   const [sortField, setSortField] = useState("time");
   const [sortOrder, setSortOrder] = useState("desc"); // 'asc' | 'desc'
 
-  // Selection & Inspector
+  // Selection & Inspector.
+  // selectedIndex is the single source of truth for "is the inspector open".
+  // -1 means closed. selectedEvent is always derived from it (see the sync
+  // effect below) — never set selectedEvent directly without also updating
+  // selectedIndex, or the two can fall out of sync (see closeInspector()).
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [copiedWhole, setCopiedWhole] = useState(false);
@@ -142,7 +174,7 @@ export const Events = () => {
     try {
       const res = await api.listEvents({ limit: 100 });
       const items = res?.items ? res.items : (Array.isArray(res) ? res : []);
-      
+
       if (isBackground && !isLive) {
         // While paused, capture delta in pending pool
         setEvents((prev) => {
@@ -187,15 +219,17 @@ export const Events = () => {
     let result = events.filter((ev) => {
       const matchesOS = filterOS === "all" || ev.host_os?.toLowerCase() === filterOS.toLowerCase();
       const service = ev.data?.service;
-      const reason = ev.data?.reason;
+      const reason = displayReason(ev.data);
+      const status = ev.data?.status;
 
       const matchesService = filterService === "all" || service === filterService;
       const matchesReason = filterReason === "all" || reason === filterReason;
+      const matchesStatus = filterStatus === "all" || status === filterStatus;
 
       const targetStr = `${ev.hostname || ""} ${ev.type_uid || ""} ${ev.username || ""} ${ev.data?.src_ip || ""} ${JSON.stringify(ev.data || {})}`.toLowerCase();
       const matchesSearch = targetStr.includes(searchTerm.toLowerCase());
 
-      return matchesOS && matchesService && matchesReason && matchesSearch;
+      return matchesOS && matchesService && matchesReason && matchesStatus && matchesSearch;
     });
 
     result.sort((a, b) => {
@@ -213,9 +247,16 @@ export const Events = () => {
     });
 
     return result;
-  }, [events, filterOS, filterService, filterReason, searchTerm, sortField, sortOrder]);
+  }, [events, filterOS, filterService, filterReason, filterStatus, searchTerm, sortField, sortOrder]);
 
-  // Keep selectedEvent in sync with index
+  // Keep selectedEvent in sync with index. This is the ONLY place
+  // selectedEvent gets set from selectedIndex — closeInspector() below
+  // resets selectedIndex to -1 specifically so this effect derives
+  // selectedEvent = null, instead of leaving selectedIndex pointing at a
+  // now-closed row. That mismatch was the previous bug: closing only
+  // cleared selectedEvent, so the next live-poll refresh of filteredEvents
+  // re-ran this effect, saw selectedIndex still >= 0, and silently
+  // reopened the inspector a few seconds later.
   useEffect(() => {
     if (selectedIndex >= 0 && selectedIndex < filteredEvents.length) {
       setSelectedEvent(filteredEvents[selectedIndex]);
@@ -223,6 +264,17 @@ export const Events = () => {
       setSelectedEvent(null);
     }
   }, [selectedIndex, filteredEvents]);
+
+  // Single close path used by every close affordance (X button, backdrop
+  // click, Escape, footer Close button). Always resets selectedIndex, not
+  // just selectedEvent — see the sync effect above for why that matters.
+  const closeInspector = useCallback(() => {
+    setSelectedIndex(-1);
+  }, []);
+
+  const openInspector = useCallback((idx) => {
+    setSelectedIndex(idx);
+  }, []);
 
   // Keyboard navigation: Up/Down arrow, Enter, Esc
   useEffect(() => {
@@ -237,15 +289,16 @@ export const Events = () => {
         setSelectedIndex((prev) => Math.max(prev - 1, 0));
       } else if (e.key === "Enter" && selectedIndex >= 0) {
         e.preventDefault();
-        setSelectedEvent(filteredEvents[selectedIndex]);
+        // selectedEvent already tracks selectedIndex via the sync effect;
+        // nothing else to do here.
       } else if (e.key === "Escape") {
-        setSelectedEvent(null);
+        closeInspector();
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [filteredEvents, selectedIndex]);
+  }, [filteredEvents, selectedIndex, closeInspector]);
 
   const handleToggleSort = (field) => {
     if (sortField === field) {
@@ -275,9 +328,10 @@ export const Events = () => {
     ).length;
   }, [selectedEvent, events]);
 
-  const activeFiltersCount = (filterOS !== "all" ? 1 : 0) + 
-                             (filterReason !== "all" ? 1 : 0) + 
-                             (filterService !== "all" ? 1 : 0) + 
+  const activeFiltersCount = (filterOS !== "all" ? 1 : 0) +
+                             (filterReason !== "all" ? 1 : 0) +
+                             (filterService !== "all" ? 1 : 0) +
+                             (filterStatus !== "all" ? 1 : 0) +
                              (searchTerm ? 1 : 0);
 
   return (
@@ -392,10 +446,25 @@ export const Events = () => {
                 <option value="all" className="bg-slate-900">All Services</option>
                 <option value="sshd" className="bg-slate-900">sshd</option>
                 <option value="sudo" className="bg-slate-900">sudo</option>
+                <option value="windows_logon" className="bg-slate-900">windows_logon</option>
               </select>
             </div>
 
-            {/* Failure Reason Filter */}
+            {/* Status Filter (success / failure) */}
+            <div className="flex items-center gap-1 bg-slate-950/80 border border-slate-800 rounded-lg px-2 py-1">
+              <span className="text-slate-400 font-medium">Status:</span>
+              <select
+                value={filterStatus}
+                onChange={(e) => setFilterStatus(e.target.value)}
+                className="bg-transparent text-slate-200 font-medium outline-none cursor-pointer"
+              >
+                <option value="all" className="bg-slate-900">All</option>
+                <option value="success" className="bg-slate-900">Success</option>
+                <option value="failure" className="bg-slate-900">Failure</option>
+              </select>
+            </div>
+
+            {/* Reason Filter */}
             <div className="flex items-center gap-1 bg-slate-950/80 border border-slate-800 rounded-lg px-2 py-1">
               <span className="text-slate-400 font-medium">Reason:</span>
               <select
@@ -404,9 +473,22 @@ export const Events = () => {
                 className="bg-transparent text-slate-200 font-medium outline-none cursor-pointer"
               >
                 <option value="all" className="bg-slate-900">All Reasons</option>
-                <option value="bad_password" className="bg-slate-900">bad_password</option>
-                <option value="unknown_user" className="bg-slate-900">unknown_user</option>
-                <option value="sudo_bad_password" className="bg-slate-900">sudo_bad_password</option>
+                <optgroup label="Success">
+                  <option value="password" className="bg-slate-900">password</option>
+                  <option value="publickey" className="bg-slate-900">publickey</option>
+                </optgroup>
+                <optgroup label="Failure">
+                  <option value="bad_password" className="bg-slate-900">bad_password</option>
+                  <option value="unknown_user" className="bg-slate-900">unknown_user</option>
+                  <option value="sudo_bad_password" className="bg-slate-900">sudo_bad_password</option>
+                </optgroup>
+                <optgroup label="Windows events (no reason field)">
+                  <option value="account_created" className="bg-slate-900">account_created</option>
+                  <option value="account_deleted" className="bg-slate-900">account_deleted</option>
+                  <option value="password_reset" className="bg-slate-900">password_reset</option>
+                  <option value="group_member_added" className="bg-slate-900">group_member_added</option>
+                  <option value="logon" className="bg-slate-900">logon</option>
+                </optgroup>
               </select>
             </div>
           </div>
@@ -434,6 +516,12 @@ export const Events = () => {
                 <button onClick={() => setFilterService("all")} className="hover:text-white"><X className="h-3 w-3" /></button>
               </span>
             )}
+            {filterStatus !== "all" && (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs">
+                status: {filterStatus}
+                <button onClick={() => setFilterStatus("all")} className="hover:text-white"><X className="h-3 w-3" /></button>
+              </span>
+            )}
             {filterReason !== "all" && (
               <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs">
                 reason: {filterReason}
@@ -445,6 +533,7 @@ export const Events = () => {
                 setSearchTerm("");
                 setFilterOS("all");
                 setFilterService("all");
+                setFilterStatus("all");
                 setFilterReason("all");
               }}
               className="text-xs text-slate-400 hover:text-rose-400 underline ml-2 transition-colors"
@@ -491,9 +580,10 @@ export const Events = () => {
                     )}
                   </div>
                 </th>
+                <th className="py-3 px-6">Status</th>
                 <th className="py-3 px-6">Host / Target User</th>
                 <th className="py-3 px-6">Service / Source IP</th>
-                <th className="py-3 px-6">Failure Reason</th>
+                <th className="py-3 px-6">Reason</th>
                 <th className="py-3 px-6">Type UID</th>
                 <th className="py-3 px-6 text-right">Details</th>
               </tr>
@@ -501,25 +591,24 @@ export const Events = () => {
             <tbody className="divide-y divide-slate-800/60 text-xs text-slate-300">
               {filteredEvents.length === 0 && !loading ? (
                 <tr>
-                  <td colSpan="7" className="py-12 text-center text-slate-400">
+                  <td colSpan="8" className="py-12 text-center text-slate-400">
                     <p className="font-medium text-slate-300 text-sm">No telemetry records match your current filters</p>
                     <p className="text-xs text-slate-500 mt-1">Try broadening your search query or reset active filters.</p>
                   </td>
                 </tr>
               ) : (
                 filteredEvents.map((ev, idx) => {
-                  const isSelected = selectedEvent?.event_id === ev.event_id || selectedIndex === idx;
+                  const isSelected = selectedIndex === idx;
                   const service = ev.data?.service || "—";
                   const srcIp = ev.data?.src_ip;
-                  const reason = ev.data?.reason || "—";
+                  const reason = displayReason(ev.data);
+                  const hasRealReason = Boolean(ev.data?.reason);
+                  const status = ev.data?.status;
 
                   return (
                     <tr
                       key={ev.event_id}
-                      onClick={() => {
-                        setSelectedIndex(idx);
-                        setSelectedEvent(ev);
-                      }}
+                      onClick={() => openInspector(idx)}
                       className={`cursor-pointer transition-colors ${
                         isSelected
                           ? "bg-indigo-600/15 border-l-2 border-indigo-500"
@@ -532,6 +621,9 @@ export const Events = () => {
                       </td>
                       <td className="py-3 px-6 whitespace-nowrap">
                         {getSeverityBadge(ev.severity_id)}
+                      </td>
+                      <td className="py-3 px-6 whitespace-nowrap">
+                        <StatusPill status={status} />
                       </td>
                       <td className="py-3 px-6">
                         <div className="font-semibold text-slate-100">{ev.hostname}</div>
@@ -552,9 +644,22 @@ export const Events = () => {
                         )}
                       </td>
                       <td className="py-3 px-6">
-                        <span className="font-mono text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20 text-[11px]">
-                          {reason}
-                        </span>
+                        {reason ? (
+                          <span
+                            className={`font-mono px-2 py-0.5 rounded border text-[11px] ${
+                              !hasRealReason
+                                ? "text-slate-300 bg-slate-800/60 border-slate-700"
+                                : status === "success"
+                                ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
+                                : "text-amber-400 bg-amber-500/10 border-amber-500/20"
+                            }`}
+                            title={hasRealReason ? undefined : "No `reason` field on this event — showing the event type instead"}
+                          >
+                            {reason}
+                          </span>
+                        ) : (
+                          <span className="text-slate-600 text-[11px]">—</span>
+                        )}
                       </td>
                       <td className="py-3 px-6 font-mono text-indigo-300 text-[11px]">
                         {ev.type_uid}
@@ -573,11 +678,11 @@ export const Events = () => {
 
       {/* Upgraded Slide-out Inspector Panel */}
       {selectedEvent && (
-        <div 
+        <div
           className="fixed inset-0 z-50 flex justify-end bg-slate-950/75 backdrop-blur-sm transition-opacity"
-          onClick={() => setSelectedEvent(null)}
+          onClick={closeInspector}
         >
-          <div 
+          <div
             className="w-full max-w-2xl bg-slate-900 border-l border-slate-800 h-full overflow-y-auto shadow-2xl p-6 flex flex-col justify-between"
             onClick={(e) => e.stopPropagation()}
           >
@@ -589,7 +694,10 @@ export const Events = () => {
                     <Terminal className="h-5 w-5" />
                   </div>
                   <div>
-                    <h3 className="text-base font-semibold text-slate-100">Telemetry Event Inspector</h3>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-base font-semibold text-slate-100">Telemetry Event Inspector</h3>
+                      <StatusPill status={selectedEvent.data?.status} />
+                    </div>
                     <span className="text-xs font-mono text-slate-400 truncate max-w-xs block">
                       {selectedEvent.event_id}
                     </span>
@@ -618,7 +726,7 @@ export const Events = () => {
                     <ChevronRight className="h-5 w-5" />
                   </button>
                   <button
-                    onClick={() => setSelectedEvent(null)}
+                    onClick={closeInspector}
                     aria-label="Close inspector"
                     className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 ml-2"
                   >
@@ -636,7 +744,7 @@ export const Events = () => {
                   <button
                     onClick={() => {
                       setSearchTerm(selectedEvent.data?.src_ip || selectedEvent.username || "");
-                      setSelectedEvent(null);
+                      closeInspector();
                     }}
                     className="text-indigo-400 hover:underline inline-flex items-center gap-1 font-medium"
                   >
@@ -657,7 +765,12 @@ export const Events = () => {
                   <FieldCopyPill label="Target User" value={selectedEvent.username} onFilterSelect={(val) => setSearchTerm(val)} />
                   <FieldCopyPill label="Service" value={selectedEvent.data?.service} onFilterSelect={(val) => setFilterService(val)} />
                   <FieldCopyPill label="Source IP" value={selectedEvent.data?.src_ip} onFilterSelect={(val) => setSearchTerm(val)} />
-                  <FieldCopyPill label="Failure Reason" value={selectedEvent.data?.reason} onFilterSelect={(val) => setFilterReason(val)} />
+                  <FieldCopyPill label="Status" value={selectedEvent.data?.status} onFilterSelect={(val) => setFilterStatus(val)} />
+                  <FieldCopyPill
+                    label={selectedEvent.data?.reason ? "Reason" : "Event"}
+                    value={displayReason(selectedEvent.data)}
+                    onFilterSelect={(val) => setFilterReason(val)}
+                  />
                   <FieldCopyPill label="Agent ID" value={selectedEvent.agent_id} />
                 </div>
               </div>
@@ -701,7 +814,7 @@ export const Events = () => {
             <div className="pt-4 border-t border-slate-800 flex items-center justify-between">
               <span className="text-xs text-slate-500 font-mono">Press ESC or click backdrop to close</span>
               <button
-                onClick={() => setSelectedEvent(null)}
+                onClick={closeInspector}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-medium transition-colors"
               >
                 Close Inspector

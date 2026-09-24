@@ -8,7 +8,10 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from decoders import decode_event, PARSER_VERSION
+import logging
 
+logger = logging.getLogger(__name__)
 
 from db.database import get_db
 from db.models import Agent, Event
@@ -66,40 +69,80 @@ async def _authenticate(websocket: WebSocket, db: AsyncSession) -> Optional[Agen
 
 
 async def _handle_event(db: AsyncSession, websocket: WebSocket, msg: WSEvent, agent: Agent) -> None:
-    # events.time is TIMESTAMP WITH TIME ZONE. Always hand asyncpg a tz-aware
-    # UTC datetime: a naive one would be interpreted as the server's LOCAL time.
     if msg.time.tzinfo:
         event_time = msg.time.astimezone(timezone.utc)
     else:
-        event_time = msg.time.replace(tzinfo=timezone.utc)  # agents send UTC
+        event_time = msg.time.replace(tzinfo=timezone.utc)
+
+    class_uid = msg.class_uid
+    category_uid = msg.category_uid
+    activity_id = msg.activity_id
+    type_uid = msg.type_uid
+    severity_id = msg.severity_id
+    username = msg.username
+    data = msg.data
+    metadata = dict(msg.metadata or {})
+
+    # msg.data looks like {"source": "journald", "raw": {...}} (or
+    # "windows-4624"/"windows-4625" for Windows). "raw" is the inner
+    # object the decoder consumes, not the whole data dict.
+    raw = msg.data.get("raw")
+    source = msg.data.get("source") if raw is not None else None
+
+    if raw is not None:
+        try:
+            decoded = await decode_event(source, raw, db)
+        except Exception:
+            logger.exception("decoder crashed for event %s source=%r", msg.event_id, source)
+            decoded = None
+            
+        if decoded is None:
+            # D4: ack so the agent doesn't retry forever, but don't store it.
+            metadata["parser_version"] = PARSER_VERSION
+            metadata["decode_failed"] = True
+            logger.warning("dropping undecodable event %s source=%r", msg.event_id, source)
+            await websocket.send_json({"type": "ack", "event_id": str(msg.event_id)})
+            return
+
+        class_uid = decoded["class_uid"]
+        category_uid = decoded["category_uid"]
+        activity_id = decoded["activity_id"]
+        type_uid = decoded["type_uid"]
+        severity_id = decoded["severity_id"]
+        username = decoded["username"]
+        data = decoded["data"]
+        metadata["parser_version"] = PARSER_VERSION
+        metadata["raw"] = raw  # D6: capped-size raw copy for future retroactive redecoding
 
     stmt = (
         pg_insert(Event)
         .values(
             event_id=msg.event_id,
             time=event_time,
-            class_uid=msg.class_uid,
-            category_uid=msg.category_uid,
-            activity_id=msg.activity_id,
-            type_uid=msg.type_uid,
-            severity_id=msg.severity_id,
+            class_uid=class_uid,
+            category_uid=category_uid,
+            activity_id=activity_id,
+            type_uid=type_uid,
+            severity_id=severity_id,
             hostname=msg.hostname,
-            username=msg.username,
+            username=username,
             agent_id=agent.agent_id,
             tenant_id=agent.tenant_id,
-            metadata_=msg.metadata,
-            data=msg.data,
-            # Agent-supplied envelope fields (optional in WSEvent)
+            metadata_=metadata,
+            data=data,
             schema_version=msg.schema_version,
             agent_version=msg.agent_version,
             host_os=msg.host_os,
             host_os_version=msg.host_os_version,
-            # Server-set, never taken from the client
             ingest_source="websocket",
         )
         .on_conflict_do_nothing(index_elements=["event_id"])
     )
     await db.execute(stmt)
+
+    if msg.host_os_version and msg.host_os_version != agent.os_version:
+        agent.os_version = msg.host_os_version
+
     await db.commit()
     await websocket.send_json(WSAck(event_id=msg.event_id).model_dump(mode="json"))
 

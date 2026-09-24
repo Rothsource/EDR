@@ -17,6 +17,7 @@ class AgentResponse(BaseModel):
     agent_id: UUID
     hostname: str
     os: str
+    os_version: Optional[str] = None
     status: str
     created_at: datetime
     last_seen_at: Optional[datetime] = None

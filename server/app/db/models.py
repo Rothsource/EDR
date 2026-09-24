@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, Text, Boolean, TIMESTAMP, ForeignKey, Integer, SmallInteger, BigInteger, Index
+from sqlalchemy import Column, Text, Boolean, TIMESTAMP, ForeignKey, Integer, SmallInteger, BigInteger, Index, JSON
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -46,6 +46,7 @@ class Agent(Base):
     last_seen_at = Column(TIMESTAMP)
     ip_address = Column(Text)
     mac_address = Column(Text)
+    os_version = Column(Text)
 
     enrollment_token_obj = relationship("EnrollmentToken", back_populates="agents")
 
@@ -53,7 +54,8 @@ class Agent(Base):
 
     organization = relationship("Organization", back_populates="agents")
     events = relationship("Event", back_populates="agent")
-
+    auth_config_sources = Column(JSONB, nullable=True)
+    config_version = Column(Integer, nullable=False, server_default="1")
 
 class User(Base):
     __tablename__ = "users"
@@ -89,9 +91,11 @@ class Event(Base):
     hostname = Column(Text)
     username = Column(Text)
 
-    # Postgres currently allows NULL here (see \d events). The WS handler always sets it.
-    # To tighten: ALTER TABLE events ALTER COLUMN agent_id SET NOT NULL; then add nullable=False below.
-    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.agent_id"))
+    # Tightened to NOT NULL in Postgres by
+    # server/app/db/migrations/0001_events_agent_id_not_null.sql — run that
+    # script against the database before/when deploying this model change,
+    # or inserts will still succeed here but the two will be out of sync.
+    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.agent_id"), nullable=False)
 
     # Denormalized from Agent.tenant_id at insert time — never trust a client-supplied value here
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("organizations.org_id"), nullable=False)

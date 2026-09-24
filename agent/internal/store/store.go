@@ -36,8 +36,10 @@ type Store struct {
 }
 
 // Open creates outbox.db next to config.json/state.json (via config.Dir()),
-// enables WAL mode so a burst of writes doesn't block concurrent reads, and
-// ensures the schema exists.
+// enables WAL mode so a burst of writes doesn't block concurrent reads, sets
+// a busy timeout so a brief collision with another process (e.g. dumpoutbox
+// reading the file) retries instead of failing outright, and ensures the
+// schema exists.
 func Open() (*Store, error) {
 	path := filepath.Join(config.Dir(), "outbox.db")
 
@@ -46,9 +48,20 @@ func Open() (*Store, error) {
 		return nil, fmt.Errorf("cannot open outbox db: %w", err)
 	}
 
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("cannot enable WAL mode: %w", err)
+	}
+
+	// Without this, a second process (e.g. dumpoutbox) briefly opening the
+	// same file can make a concurrent write here fail immediately with
+	// SQLITE_BUSY instead of waiting a moment and succeeding. 5s is long
+	// enough for any tool's quick read to finish.
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("cannot set busy_timeout: %w", err)
 	}
 
 	const schema = `

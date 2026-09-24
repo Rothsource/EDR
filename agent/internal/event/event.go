@@ -24,7 +24,6 @@
 package event
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -116,27 +115,10 @@ func hostInfo() (name, version string) {
 	return hostName, osVersion
 }
 
-// detectOSVersion returns a human-readable OS version, or "" if unknown
-// (the server column is nullable). Linux reads /etc/os-release.
-// TODO: Windows (registry ProductName/DisplayVersion or RtlGetVersion).
-func detectOSVersion() string {
-	if runtime.GOOS != "linux" {
-		return ""
-	}
-	f, err := os.Open("/etc/os-release")
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.HasPrefix(line, "PRETTY_NAME=") {
-			return strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
-		}
-	}
-	return ""
-}
+// detectOSVersion is implemented per-platform in version_linux.go,
+// version_windows.go, and version_other.go (the fallback for anything
+// else), so this package never imports a platform-specific package (like
+// golang.org/x/sys/windows/registry) into a build for a different OS.
 
 // clip truncates s to at most n characters (runes), matching pydantic's
 // max_length, which counts characters rather than bytes.
